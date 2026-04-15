@@ -178,8 +178,10 @@ class SignalCommand:
     async def handle(ctx: CommandContext, data: dict) -> RoomParticipantPair:
         if not ctx.current_room or not ctx.current_participant:
             return ctx.current_room, ctx.current_participant
-
         target_id = data.get("target_id")
+        if target_id == ctx.current_participant.id:
+            logger.warning(f"Попытка отправить сигнал самому себе от {ctx.current_participant.id}")
+            return ctx.current_room, ctx.current_participant
         signal_data = data.get("data")
         if not target_id or not signal_data:
             return ctx.current_room, ctx.current_participant

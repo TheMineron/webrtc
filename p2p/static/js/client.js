@@ -9,8 +9,8 @@ let incomingOffers = new Set();
 
 const iceServers = {
     iceServers: [
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" }
+        {urls: "stun:stun.l.google.com:19302"},
+        {urls: "stun:stun1.l.google.com:19302"}
     ]
 };
 
@@ -33,7 +33,7 @@ function logStat(msg) {
 
 async function initLocalStream() {
     try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
         localVideo.srcObject = localStream;
         logStat("Локальный поток получен");
     } catch (err) {
@@ -47,7 +47,13 @@ function createPeerConnection(targetId, targetName) {
     const dataChannel = pc.createDataChannel("metrics");
     let callStartTime = performance.now();
 
-    peerConnections.set(targetId, { pc, targetName, callStartTime, dataChannel });
+    peerConnections.set(targetId, {
+        pc,
+        targetName,
+        callStartTime,
+        dataChannel,
+        processedSignals: new Set()
+    });
 
     if (localStream) {
         localStream.getTracks().forEach(track => {
@@ -68,7 +74,7 @@ function createPeerConnection(targetId, targetName) {
             ws.send(JSON.stringify({
                 type: "signal",
                 target_id: targetId,
-                data: { type: "ice", candidate: event.candidate }
+                data: {type: "ice", candidate: event.candidate}
             }));
         }
     };
@@ -93,7 +99,7 @@ function createPeerConnection(targetId, targetName) {
             const setupTime = performance.now() - callStartTime;
             callSetupTimes.set(targetId, setupTime);
             logStat(`[МЕТРИКА] Call Setup Time для ${targetName}: ${setupTime.toFixed(2)} ms`);
-            sendMetricsToServer({ type: "call_setup_time", targetId, targetName, value: setupTime });
+            sendMetricsToServer({type: "call_setup_time", targetId, targetName, value: setupTime});
         }
         remoteVideo.srcObject = event.streams[0];
         logStat(`Установлен видеопоток от ${targetName} (${targetId})`);
@@ -153,8 +159,7 @@ function handleDataChannelMessage(event) {
             }
         };
         remoteVideo.requestVideoFrameCallback(checkFrame);
-    }
-    else if (data.type === "video_e2e_response") {
+    } else if (data.type === "video_e2e_response") {
         const detectionTime = data.detection_time;
         const senderFlashTime = data.sender_flash_time;
         const now = performance.now();
@@ -163,7 +168,7 @@ function handleDataChannelMessage(event) {
         logStat(`[МЕТРИКА] E2E задержка видео (оценка): ${oneWayLatency.toFixed(2)} ms (RTC коррекция: RTT=${rtt.toFixed(2)} ms)`);
         const latencyResultDiv = document.getElementById("latencyResult");
         if (latencyResultDiv) latencyResultDiv.innerHTML = `E2E задержка видео: ${oneWayLatency.toFixed(2)} ms`;
-        sendMetricsToServer({ type: "e2e_video_latency", value: oneWayLatency, rtt: rtt });
+        sendMetricsToServer({type: "e2e_video_latency", value: oneWayLatency, rtt: rtt});
     }
 }
 
@@ -185,7 +190,7 @@ async function callParticipant(targetId, targetName) {
         ws.send(JSON.stringify({
             type: "signal",
             target_id: targetId,
-            data: { type: "offer", sdp: pcInstance.localDescription.sdp }
+            data: {type: "offer", sdp: pcInstance.localDescription.sdp}
         }));
         logStat(`Отправлен offer для ${targetName}`);
     } catch (err) {
@@ -195,7 +200,7 @@ async function callParticipant(targetId, targetName) {
 
 async function collectWebRTCStats() {
     for (const [targetId, entry] of peerConnections.entries()) {
-        const { pc, targetName } = entry;
+        const {pc, targetName} = entry;
         if (!pc) continue;
         try {
             const stats = await pc.getStats();
@@ -218,13 +223,19 @@ async function collectWebRTCStats() {
                         if (deltaTime > 0) lostPerSecond = deltaLost / deltaTime;
                     }
                 }
-                lastStats.set(targetId, { packetsLost, timestamp: performance.now() });
+                lastStats.set(targetId, {packetsLost, timestamp: performance.now()});
 
                 const statsText = `[${targetName}] Video jitter: ${jitter} ms, packetLoss: ${packetsLost} (${lostPerSecond.toFixed(2)} pkt/s), frames: ${framesDecoded}`;
                 logStat(statsText);
                 const webrtcStatsDiv = document.getElementById("webrtcStats");
                 if (webrtcStatsDiv) webrtcStatsDiv.innerHTML = statsText;
-                sendMetricsToServer({ type: "webrtc_stats", targetId, jitter_ms: parseFloat(jitter), packetsLost, lostPerSecond });
+                sendMetricsToServer({
+                    type: "webrtc_stats",
+                    targetId,
+                    jitter_ms: parseFloat(jitter),
+                    packetsLost,
+                    lostPerSecond
+                });
             }
             if (inboundAudio) {
                 const audioJitter = inboundAudio.jitter ? (inboundAudio.jitter * 1000).toFixed(2) : 'N/A';
@@ -235,6 +246,7 @@ async function collectWebRTCStats() {
         }
     }
 }
+
 setInterval(collectWebRTCStats, 5000);
 
 async function runE2ELatencyTest() {
@@ -293,69 +305,96 @@ function sendMetricsToServer(metricData) {
 }
 
 async function handleSignal(fromId, fromName, data) {
-    console.log("Получен сигнал:", { fromId, fromName, data });
+    console.log("Получен сигнал:", {fromId, fromName, data});
+
     let entry = peerConnections.get(fromId);
     let pc = entry ? entry.pc : null;
 
+    let signalKey = null;
+    if (data.type === "offer" || data.type === "answer") {
+        signalKey = `${data.type}_${data.sdp}`;
+        if (entry && entry.processedSignals.has(signalKey)) {
+            logStat(`Игнорируем повторный ${data.type} от ${fromName}`);
+            return;
+        }
+    }
+
     if (!pc && data.type === "offer") {
         pc = createPeerConnection(fromId, fromName);
-        incomingOffers.add(fromId);
+        entry = peerConnections.get(fromId);
+        if (entry && signalKey) entry.processedSignals.add(signalKey);
     }
+
     if (!pc) return;
 
     try {
-        if (data.type === "offer" || data.type === "answer") {
+        if (data.type === "offer") {
             if (!data.sdp) {
-                console.error("Нет SDP в сообщении", data);
+                console.error("Нет SDP в offer", data);
                 return;
             }
+
             const sessionDesc = new RTCSessionDescription({
-                type: data.type,
+                type: "offer",
                 sdp: data.sdp
             });
 
-            if (data.type === "offer") {
-                await pc.setRemoteDescription(sessionDesc);
-                const answer = await pc.createAnswer();
-                await pc.setLocalDescription(answer);
-                ws.send(JSON.stringify({
-                    type: "signal",
-                    target_id: fromId,
-                    data: { type: "answer", sdp: pc.localDescription.sdp }
-                }));
-                logStat(`Отправлен answer для ${fromName}`);
+            if (pc.remoteDescription && pc.signalingState !== "stable") {
+                logStat(`Игнорируем offer в состоянии ${pc.signalingState}`);
+                return;
             }
-            else if (data.type === "answer") {
-                if (pc.signalingState === "have-local-offer") {
-                    await pc.setRemoteDescription(sessionDesc);
-                    logStat(`Установлен remote description (answer) от ${fromName}`);
-                } else if (pc.signalingState === "stable") {
-                    logStat(`Answer в состоянии stable, выполняем rollback`);
-                    await pc.setLocalDescription({ type: "rollback" });
-                    await pc.setRemoteDescription(sessionDesc);
-                    logStat(`Answer применён после rollback`);
-                } else {
-                    logStat(`Answer пропущен, состояние: ${pc.signalingState}`);
-                }
+
+            await pc.setRemoteDescription(sessionDesc);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({
+                type: "signal",
+                target_id: fromId,
+                data: {type: "answer", sdp: pc.localDescription.sdp}
+            }));
+            logStat(`Отправлен answer для ${fromName}`);
+        } else if (data.type === "answer") {
+            if (!data.sdp) {
+                console.error("Нет SDP в answer", data);
+                return;
             }
-        }
-        else if (data.type === "ice") {
+
+            if (pc.signalingState !== "have-local-offer") {
+                logStat(`Answer пропущен, состояние: ${pc.signalingState}, ожидалось have-local-offer`);
+                return;
+            }
+
+            const sessionDesc = new RTCSessionDescription({
+                type: "answer",
+                sdp: data.sdp
+            });
+            await pc.setRemoteDescription(sessionDesc);
+            logStat(`Установлен remote description (answer) от ${fromName}`);
+
+            if (entry && signalKey) entry.processedSignals.add(signalKey);
+        } else if (data.type === "ice") {
             if (pc.remoteDescription) {
                 if (data.candidate) {
-                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-                    logStat(`Добавлен ICE-кандидат от ${fromName}`);
+                    try {
+                        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                        logStat(`Добавлен ICE-кандидат от ${fromName}`);
+                    } catch (iceErr) {
+                        console.warn("Ошибка добавления ICE-кандидата:", iceErr);
+                    }
                 } else {
                     logStat(`Пустой ICE-кандидат от ${fromName}, игнорируем`);
                 }
             } else {
                 logStat(`ICE кандидат получен до установки remote description, игнорируем`);
             }
-        }
-        else {
+        } else {
             console.warn("Неизвестный тип сигнала:", data.type);
         }
     } catch (err) {
         console.error("Ошибка обработки сигнала:", err);
+        if (err.name === "InvalidStateError" && pc.signalingState === "stable") {
+            logStat("Попытка восстановления: перезапуск ICE");
+        }
     }
 }
 
@@ -363,7 +402,7 @@ async function joinRoom(roomId, nickname) {
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
     ws.onopen = () => {
-        ws.send(JSON.stringify({ type: "join", room: roomId, nickname: nickname }));
+        ws.send(JSON.stringify({type: "join", room: roomId, nickname: nickname}));
     };
 
     ws.onmessage = async (event) => {
@@ -412,7 +451,7 @@ async function joinRoom(roomId, nickname) {
             case "pong":
                 const rtt = Date.now() - msg.timestamp;
                 logStat(`WebSocket RTT: ${rtt} ms`);
-                sendMetricsToServer({ type: "ws_rtt", value: rtt });
+                sendMetricsToServer({type: "ws_rtt", value: rtt});
                 break;
         }
     };
@@ -425,7 +464,7 @@ async function joinRoom(roomId, nickname) {
 
 setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "ping", timestamp: Date.now() }));
+        ws.send(JSON.stringify({type: "ping", timestamp: Date.now()}));
     }
 }, 5000);
 
