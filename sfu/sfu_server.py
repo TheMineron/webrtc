@@ -27,7 +27,6 @@ class Room:
         if participant_id in self.participants:
             del self.participants[participant_id]
             logger.info(f"Participant {participant_id} removed from room {self.id}")
-            # Если комната опустела, можно удалить её из глобального списка
             if not self.participants:
                 rooms.pop(self.id, None)
                 logger.info(f"Room {self.id} deleted (empty)")
@@ -42,13 +41,9 @@ class Room:
                 await self._renegotiate(p.peer_connection)
 
     async def _renegotiate(self, pc: RTCPeerConnection):
-        """Пересоздать offer/answer при добавлении нового трека."""
         try:
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
-            # В реальном сценарии здесь нужно отправить offer клиенту
-            # В данной упрощённой реализации предполагается, что клиент
-            # самостоятельно инициирует переговоры при необходимости.
         except Exception as e:
             logger.error(f"Renegotiation error: {e}")
 
@@ -81,8 +76,30 @@ class Participant:
 rooms: Dict[str, Room] = {}
 
 
+def create_ice_candidate_from_js(cand_data: dict) -> RTCIceCandidate:
+    """Создаёт объект RTCIceCandidate из словаря, присланного браузером."""
+    # В зависимости от версии aiortc либо используем from_js, либо конструируем вручную
+    if hasattr(RTCIceCandidate, "from_js"):
+        return RTCIceCandidate.from_js(cand_data)
+    else:
+        # Ручное создание для старых версий aiortc
+        return RTCIceCandidate(
+            component=cand_data.get("component", 1),  # обычно RTP
+            foundation=cand_data.get("foundation", ""),
+            ip=cand_data.get("ip", ""),
+            port=cand_data.get("port", 0),
+            priority=cand_data.get("priority", 0),
+            protocol=cand_data.get("protocol", ""),
+            type=cand_data.get("type", ""),
+            relatedAddress=cand_data.get("relatedAddress"),
+            relatedPort=cand_data.get("relatedPort"),
+            sdpMid=cand_data.get("sdpMid"),
+            sdpMLineIndex=cand_data.get("sdpMLineIndex"),
+            tcpType=cand_data.get("tcpType")
+        )
+
+
 async def handle_client(websocket):
-    """Обработчик WebSocket-соединения от клиента."""
     participant_id = None
     room = None
     participant = None
@@ -128,9 +145,8 @@ async def handle_client(websocket):
                 if not participant:
                     continue
                 cand_data = data["candidate"]
-                # Преобразуем JS-представление в объект aiortc.RTCIceCandidate
-                candidate = RTCIceCandidate.from_js(cand_data)
                 try:
+                    candidate = create_ice_candidate_from_js(cand_data)
                     await participant.peer_connection.addIceCandidate(candidate)
                 except Exception as e:
                     logger.warning(f"Failed to add ICE candidate: {e}")
@@ -152,7 +168,6 @@ async def handle_client(websocket):
 
 
 async def main():
-    # Попытка загрузить SSL-сертификаты, при отсутствии — работа без шифрования
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     try:
         ssl_context.load_cert_chain("cert.pem", "key.pem")
