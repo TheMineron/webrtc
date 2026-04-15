@@ -205,28 +205,8 @@ function handleDataChannelMessage(event) {
 
 async function callParticipant(targetId, targetName) {
     if (peerConnections.has(targetId)) return;
-
-    if (incomingOffers.has(targetId)) {
-        logStat(`Не отправляем offer для ${targetName}, уже получен входящий offer`);
-        return;
-    }
-
     createPeerConnection(targetId, targetName);
-    const entry = peerConnections.get(targetId);
-    const pcInstance = entry.pc;
-
-    try {
-        const offer = await pcInstance.createOffer();
-        await pcInstance.setLocalDescription(offer);
-        ws.send(JSON.stringify({
-            type: "signal",
-            target_id: targetId,
-            data: {type: "offer", sdp: pcInstance.localDescription.sdp}
-        }));
-        logStat(`Отправлен offer для ${targetName}`);
-    } catch (err) {
-        console.error("Ошибка создания offer:", err);
-    }
+    logStat(`Инициировано соединение с ${targetName} (offer будет отправлен автоматически)`);
 }
 
 async function collectWebRTCStats() {
@@ -392,6 +372,7 @@ async function handleSignal(fromId, fromName, data) {
 }
 
 async function joinRoom(roomId, nickname) {
+    await initLocalStream();
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
     ws.onopen = () => {
@@ -410,7 +391,6 @@ async function joinRoom(roomId, nickname) {
                 videoGrid.style.display = "flex";
                 document.getElementById("stats").style.display = "block";
                 logStat(`Присоединились к комнате ${roomId} как ${nickname}`);
-                await initLocalStream();
                 break;
 
             case "existing_participants":
