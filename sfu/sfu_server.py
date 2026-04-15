@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
+import ssl
 from typing import Dict, Set, Optional, List
 
 import websockets
@@ -171,8 +172,16 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
             logger.info(f"Room {current_room.room_id} deleted (empty)")
 
 async def main():
-    async with websockets.serve(sfu_websocket_handler, "0.0.0.0", 8001):
-        logger.info("SFU server running on ws://0.0.0.0:8001")
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain('cert.pem', 'key.pem')
+
+    async with websockets.serve(
+        sfu_websocket_handler,
+        "0.0.0.0",
+        8001,
+        ssl=ssl_context
+    ):
+        logger.info("SFU server running on wss://0.0.0.0:8001")
         await asyncio.Future()
 
 if __name__ == "__main__":
