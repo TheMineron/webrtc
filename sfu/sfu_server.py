@@ -1,184 +1,161 @@
-import asyncio
+import json
 import json
 import logging
-import ssl
-import uuid
-from typing import Dict, Optional
+from typing import Dict, List
 
-import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
 from aiortc.contrib.media import MediaRelay
-from aiortc.sdp import candidate_from_sdp
-from websockets.legacy.server import WebSocketServerProtocol
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("SFU")
+logger = logging.getLogger("sfu")
 
-class SFURoom:
-    def __init__(self, room_id: str):
+app = FastAPI()
+
+# Хранилище комнат: room_id -> список участников
+rooms: Dict[str, List["SFUParticipant"]] = {}
+
+
+class SFUParticipant:
+    """Участник комнаты на SFU"""
+    def __init__(self, room_id: str, websocket: WebSocket, participant_id: str):
         self.room_id = room_id
-        self.participants: Dict[str, RTCPeerConnection] = {}
-        self.relay = MediaRelay()
-        self.published_tracks: Dict[str, Dict[str, MediaStreamTrack]] = {}  # participant_id -> {kind: track}
+        self.websocket = websocket
+        self.id = participant_id
+        self.pc = RTCPeerConnection()
+        self.relay = MediaRelay()           # для ретрансляции треков
+        self.incoming_tracks = {}           # kind -> track
+        self.outgoing_senders = {}           # (target_participant_id, kind) -> RTCRtpSender
 
-    def add_participant(self, participant_id: str, pc: RTCPeerConnection):
-        self.participants[participant_id] = pc
-        logger.info(f"[{self.room_id}] Participant {participant_id} added")
+        # Обработка входящих треков
+        @self.pc.on("track")
+        async def on_track(track: MediaStreamTrack):
+            logger.info(f"Participant {self.id} sent {track.kind} track")
+            self.incoming_tracks[track.kind] = track
 
-    def remove_participant(self, participant_id: str):
-        pc = self.participants.pop(participant_id, None)
-        if pc:
-            asyncio.create_task(pc.close())
-        self.published_tracks.pop(participant_id, None)
-        logger.info(f"[{self.room_id}] Participant {participant_id} removed")
+            # Ретранслируем трек всем остальным участникам комнаты
+            for other in rooms.get(self.room_id, []):
+                if other.id != self.id:
+                    await other.add_remote_track(self.id, track.kind, self.relay.subscribe(track))
 
-    def add_existing_tracks_to(self, target_pc: RTCPeerConnection):
-        """Добавить все ранее опубликованные треки новому участнику."""
-        for src_id, tracks in self.published_tracks.items():
-            for kind, src_track in tracks.items():
-                relayed = self.relay.subscribe(src_track)
-                target_pc.addTrack(relayed)
-                logger.info(f"[{self.room_id}] Added existing {kind} from {src_id} to newcomer")
+        @self.pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            if self.pc.connectionState == "failed":
+                await self.close()
 
-    def publish_track(self, participant_id: str, track: MediaStreamTrack):
-        """Сохраняет оригинальный трек и рассылает его всем остальным участникам."""
-        if participant_id not in self.published_tracks:
-            self.published_tracks[participant_id] = {}
-        self.published_tracks[participant_id][track.kind] = track
-        logger.info(f"[{self.room_id}] Published {track.kind} from {participant_id}")
+    async def add_remote_track(self, source_id: str, kind: str, track: MediaStreamTrack):
+        """Добавить трек от другого участника в своё соединение"""
+        # Добавляем трек в PeerConnection
+        sender = self.pc.addTrack(track)
+        self.outgoing_senders[(source_id, kind)] = sender
 
-        # Рассылаем этот трек всем остальным участникам
-        for other_id, other_pc in self.participants.items():
-            if other_id != participant_id:
-                relayed = self.relay.subscribe(track)
-                other_pc.addTrack(relayed)
-                logger.info(f"[{self.room_id}] Sent {track.kind} from {participant_id} to {other_id}")
+        # Отправляем клиенту предложение пересмотреть SDP (renegotiation)
+        await self._renegotiate()
 
-rooms: Dict[str, SFURoom] = {}
+    async def _renegotiate(self):
+        """Инициировать пересмотр соединения и отправить новый SDP клиенту"""
+        # Создаём offer
+        offer = await self.pc.createOffer()
+        await self.pc.setLocalDescription(offer)
 
-async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
-    participant_id = str(uuid.uuid4())
-    current_room: Optional[SFURoom] = None
-    pc: Optional[RTCPeerConnection] = None
-    pending_candidates = []
+        # Отправляем клиенту сообщение с новым SDP
+        await self.websocket.send_json({
+            "type": "renegotiate",
+            "sdp": self.pc.localDescription.sdp,
+            "type_sdp": self.pc.localDescription.type
+        })
 
+        # Ждём ответа от клиента (answer)
+        # Ответ придёт отдельным сообщением типа "answer"
+        # Обработка в основном цикле WebSocket
+
+    async def handle_answer(self, sdp: str, sdp_type: str):
+        """Применить answer от клиента после renegotiation"""
+        answer = RTCSessionDescription(sdp=sdp, type=sdp_type)
+        await self.pc.setRemoteDescription(answer)
+
+    async def close(self):
+        """Закрыть соединение и удалить участника из комнаты"""
+        if self.room_id in rooms:
+            rooms[self.room_id].remove(self)
+            if not rooms[self.room_id]:
+                del rooms[self.room_id]
+        await self.pc.close()
+        logger.info(f"Participant {self.id} removed from room {self.room_id}")
+
+
+@app.websocket("/ws")
+async def sfu_websocket(websocket: WebSocket):
+    await websocket.accept()
+    participant = None
     try:
-        async for message in websocket:
-            data = json.loads(message)
-            msg_type = data.get("type")
+        # Ожидаем первое сообщение с типом "join"
+        data = await websocket.receive_text()
+        msg = json.loads(data)
+        if msg.get("type") != "join":
+            await websocket.close(code=1002, reason="First message must be join")
+            return
 
-            if msg_type == "join":
-                room_id = data.get("room")
-                if not room_id:
-                    await websocket.send(json.dumps({"type": "error", "message": "room required"}))
-                    continue
-                if room_id not in rooms:
-                    rooms[room_id] = SFURoom(room_id)
-                current_room = rooms[room_id]
+        room_id = msg.get("room")
+        participant_id = msg.get("participant_id")
+        if not room_id or not participant_id:
+            await websocket.close(code=1002, reason="Missing room or participant_id")
+            return
 
-                pc = RTCPeerConnection()
+        # Создаём участника
+        participant = SFUParticipant(room_id, websocket, participant_id)
 
-                @pc.on("track")
-                def on_track(track):
-                    logger.info(f"[{current_room.room_id}] Received track {track.kind} from {participant_id}")
-                    current_room.publish_track(participant_id, track)
+        # Добавляем в комнату
+        if room_id not in rooms:
+            rooms[room_id] = []
+        rooms[room_id].append(participant)
+        logger.info(f"Participant {participant_id} joined SFU room {room_id}")
 
-                @pc.on("iceconnectionstatechange")
-                def on_ice_state():
-                    state = pc.iceConnectionState
-                    logger.info(f"[{current_room.room_id}] ICE state for {participant_id}: {state}")
-                    if state in ["failed", "closed", "disconnected"]:
-                        asyncio.create_task(handle_disconnect())
+        # Сообщаем клиенту, что подключение к SFU готово
+        await websocket.send_json({"type": "ready"})
 
-                @pc.on("connectionstatechange")
-                def on_connection_state():
-                    state = pc.connectionState
-                    logger.info(f"[{current_room.room_id}] Connection state for {participant_id}: {state}")
-                    if state in ["failed", "closed"]:
-                        asyncio.create_task(handle_disconnect())
+        # Основной цикл обработки сообщений (offer, answer)
+        while True:
+            data = await websocket.receive_text()
+            msg = json.loads(data)
+            msg_type = msg.get("type")
 
-                async def handle_disconnect():
-                    if current_room:
-                        current_room.remove_participant(participant_id)
-                        try:
-                            await websocket.close()
-                        except:
-                            pass
-
-                current_room.add_participant(participant_id, pc)
-                await websocket.send(json.dumps({"type": "joined", "participant_id": participant_id}))
-
-            elif msg_type == "offer" and pc and current_room:
-                offer = RTCSessionDescription(sdp=data["sdp"], type="offer")
-                await pc.setRemoteDescription(offer)
-
-                answer = await pc.createAnswer()
-                await pc.setLocalDescription(answer)
-                await websocket.send(json.dumps({
+            if msg_type == "offer":
+                # Клиент отправляет offer для установки соединения
+                offer = RTCSessionDescription(sdp=msg["sdp"], type=msg["type_sdp"])
+                await participant.pc.setRemoteDescription(offer)
+                # Создаём answer
+                answer = await participant.pc.createAnswer()
+                await participant.pc.setLocalDescription(answer)
+                await websocket.send_json({
                     "type": "answer",
-                    "sdp": pc.localDescription.sdp
-                }))
+                    "sdp": participant.pc.localDescription.sdp,
+                    "type_sdp": participant.pc.localDescription.type
+                })
 
-                if pending_candidates:
-                    for candidate in pending_candidates:
-                        await pc.addIceCandidate(candidate)
-                    pending_candidates.clear()
-
-            elif msg_type == "ice-candidate" and pc:
-                candidate_data = data.get("candidate")
-                if candidate_data is None or candidate_data.get("candidate") is None:
-                    logger.info(f"End of ICE candidates for {participant_id}")
-                    continue
-
-                candidate_sdp = candidate_data.get("candidate")
-                if not candidate_sdp:
-                    continue
-
-                candidate = candidate_from_sdp(candidate_sdp)
-                if candidate:
-                    candidate.sdpMid = candidate_data.get("sdpMid")
-                    candidate.sdpMLineIndex = candidate_data.get("sdpMLineIndex", 0)
-
-                    if pc.remoteDescription:
-                        await pc.addIceCandidate(candidate)
-                        logger.info(f"ICE candidate added for {participant_id}")
-                    else:
-                        pending_candidates.append(candidate)
-                        logger.info(f"ICE candidate buffered for {participant_id}")
-                else:
-                    logger.warning(f"Failed to parse ICE candidate SDP: {candidate_sdp}")
+            elif msg_type == "answer":
+                # Ответ на renegotiation
+                await participant.handle_answer(msg["sdp"], msg["type_sdp"])
 
             elif msg_type == "ping":
-                await websocket.send(json.dumps({"type": "pong", "timestamp": data.get("timestamp")}))
+                await websocket.send_json({"type": "pong"})
 
-            else:
-                logger.warning(f"Unknown message type from {participant_id}: {msg_type}")
+            elif msg_type == "leave":
+                break
 
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"SFU WebSocket closed for {participant_id}")
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for participant {participant.id if participant else 'unknown'}")
     except Exception as e:
-        logger.exception(f"SFU error for {participant_id}: {e}")
+        logger.exception(f"Error in SFU: {e}")
     finally:
-        if current_room and participant_id:
-            current_room.remove_participant(participant_id)
-        if pc:
-            await pc.close()
-        if current_room and not current_room.participants:
-            rooms.pop(current_room.room_id, None)
-            logger.info(f"Room {current_room.room_id} deleted (empty)")
+        if participant:
+            await participant.close()
+        try:
+            await websocket.close()
+        except:
+            pass
 
-async def main():
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain('cert.pem', 'key.pem')
-
-    async with websockets.serve(
-        sfu_websocket_handler,
-        "0.0.0.0",
-        8001,
-        ssl=ssl_context
-    ):
-        logger.info("SFU server running on wss://0.0.0.0:8001")
-        await asyncio.Future()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)

@@ -26,9 +26,11 @@ class RoomInfo:
         self.id = room_id
         self.participants: Dict[str, ParticipantInfo] = {}
 
+
 rooms: Dict[str, RoomInfo] = {}
 
 SFU_WS_URL = "wss://178.154.233.36:8001/ws"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -39,7 +41,8 @@ async def lifespan(app: FastAPI):
             for room in list(rooms.values()):
                 for pid, participant in list(room.participants.items()):
                     if now - participant.last_pong > 60:
-                        logger.warning(f"Participant {participant.nickname} heartbeat timeout, closing")
+                        logger.warning(
+                            f"Participant {participant.nickname} heartbeat timeout, closing")
                         try:
                             await participant.websocket.close(code=1000)
                         except:
@@ -48,13 +51,16 @@ async def lifespan(app: FastAPI):
                         room.participants.pop(pid, None)
                         if not room.participants:
                             rooms.pop(room.id, None)
+
     asyncio.create_task(heartbeat_checker())
     logger.info("Signaling server started")
     yield
     logger.info("Signaling server stopped")
 
+
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="sfu/static"), name="static")
+
 
 @app.websocket("/ws")
 async def signaling_websocket(websocket: WebSocket):
@@ -75,7 +81,8 @@ async def signaling_websocket(websocket: WebSocket):
                 room_id = msg.get("room")
                 nickname = msg.get("nickname")
                 if not room_id or not nickname:
-                    await websocket.send_json({"type": "error", "message": "room and nickname required"})
+                    await websocket.send_json(
+                        {"type": "error", "message": "room and nickname required"})
                     continue
 
                 old_room = None
@@ -98,7 +105,8 @@ async def signaling_websocket(websocket: WebSocket):
                 current_room = rooms[room_id]
                 current_participant = ParticipantInfo(websocket, nickname, room_id)
                 current_room.participants[current_participant.id] = current_participant
-                logger.info(f"Participant {nickname} ({current_participant.id}) joined room {room_id}")
+                logger.info(
+                    f"Participant {nickname} ({current_participant.id}) joined room {room_id}")
 
                 await websocket.send_json({
                     "type": "joined",
@@ -123,13 +131,15 @@ async def signaling_websocket(websocket: WebSocket):
             else:
                 await websocket.send_json({"type": "error", "message": "Unknown command"})
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected: {current_participant.nickname if current_participant else 'unknown'}")
+        logger.info(
+            f"WebSocket disconnected: {current_participant.nickname if current_participant else 'unknown'}")
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
     finally:
         if current_room and current_participant:
             current_room.participants.pop(current_participant.id, None)
-            logger.info(f"Participant {current_participant.nickname} removed from room {current_room.id}")
+            logger.info(
+                f"Participant {current_participant.nickname} removed from room {current_room.id}")
             for p in current_room.participants.values():
                 try:
                     await p.websocket.send_json({
@@ -148,4 +158,5 @@ async def signaling_websocket(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
