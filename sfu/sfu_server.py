@@ -5,7 +5,7 @@ import ssl
 from typing import Dict
 
 import websockets
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 from aiortc.contrib.media import MediaRelay
 
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +27,10 @@ class Room:
         if participant_id in self.participants:
             del self.participants[participant_id]
             logger.info(f"Participant {participant_id} removed from room {self.id}")
+            # Если комната опустела, можно удалить её из глобального списка
+            if not self.participants:
+                rooms.pop(self.id, None)
+                logger.info(f"Room {self.id} deleted (empty)")
 
     async def broadcast_track(self, sender_id: str, track):
         """Переслать трек от одного участника всем остальным в комнате."""
@@ -42,7 +46,9 @@ class Room:
         try:
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
-            # В упрощённой реализации ре-переговоры инициируются клиентом
+            # В реальном сценарии здесь нужно отправить offer клиенту
+            # В данной упрощённой реализации предполагается, что клиент
+            # самостоятельно инициирует переговоры при необходимости.
         except Exception as e:
             logger.error(f"Renegotiation error: {e}")
 
@@ -76,7 +82,7 @@ rooms: Dict[str, Room] = {}
 
 
 async def handle_client(websocket):
-    """Обработчик WebSocket-соединения от клиента (без path)."""
+    """Обработчик WebSocket-соединения от клиента."""
     participant_id = None
     room = None
     participant = None
@@ -121,8 +127,13 @@ async def handle_client(websocket):
             elif msg_type == "ice-candidate":
                 if not participant:
                     continue
-                candidate = data["candidate"]
-                await participant.peer_connection.addIceCandidate(candidate)
+                cand_data = data["candidate"]
+                # Преобразуем JS-представление в объект aiortc.RTCIceCandidate
+                candidate = RTCIceCandidate.from_js(cand_data)
+                try:
+                    await participant.peer_connection.addIceCandidate(candidate)
+                except Exception as e:
+                    logger.warning(f"Failed to add ICE candidate: {e}")
 
             elif msg_type == "leave":
                 break
@@ -141,12 +152,15 @@ async def handle_client(websocket):
 
 
 async def main():
+    # Попытка загрузить SSL-сертификаты, при отсутствии — работа без шифрования
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     try:
         ssl_context.load_cert_chain("cert.pem", "key.pem")
+        proto = "wss"
     except FileNotFoundError:
         logger.warning("SSL certificates not found, using unencrypted WebSocket (ws://)")
         ssl_context = None
+        proto = "ws"
 
     async with websockets.serve(
         handle_client,
@@ -155,9 +169,9 @@ async def main():
         ssl=ssl_context,
         max_size=10**7,
     ):
-        proto = "wss" if ssl_context else "ws"
         logger.info(f"SFU server started on {proto}://0.0.0.0:8001")
         await asyncio.Future()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
