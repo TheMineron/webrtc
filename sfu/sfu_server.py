@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import ssl
-from typing import Dict, Set
+from typing import Dict
 
 import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription
@@ -33,18 +33,18 @@ class Room:
         for pid, p in self.participants.items():
             if pid != sender_id:
                 logger.debug(f"Relaying track from {sender_id} to {pid}")
-                # MediaRelay создаёт независимую копию трека для каждого получателя
                 relayed_track = relay.subscribe(track)
                 p.peer_connection.addTrack(relayed_track)
                 await self._renegotiate(p.peer_connection)
 
     async def _renegotiate(self, pc: RTCPeerConnection):
         """Пересоздать offer/answer при добавлении нового трека."""
-        offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        # В реальном приложении здесь нужно отправить offer клиенту через WebSocket
-        # В данной упрощённой реализации треки добавляются динамически,
-        # и браузер сам инициирует переговоры при необходимости.
+        try:
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+            # В упрощённой реализации ре-переговоры инициируются клиентом
+        except Exception as e:
+            logger.error(f"Renegotiation error: {e}")
 
 
 class Participant:
@@ -59,7 +59,6 @@ class Participant:
         @self.peer_connection.on("track")
         async def on_track(track):
             logger.info(f"Track received from {self.id}: {track.kind}")
-            # Пересылаем трек всем остальным участникам комнаты
             await self.room.broadcast_track(self.id, track)
 
         @self.peer_connection.on("connectionstatechange")
@@ -76,8 +75,8 @@ class Participant:
 rooms: Dict[str, Room] = {}
 
 
-async def handle_client(websocket, path):
-    """Обработчик WebSocket-соединения от клиента."""
+async def handle_client(websocket):
+    """Обработчик WebSocket-соединения от клиента (без path)."""
     participant_id = None
     room = None
     participant = None
@@ -94,12 +93,10 @@ async def handle_client(websocket, path):
                     await websocket.send(json.dumps({"type": "error", "message": "room and participant_id required"}))
                     continue
 
-                # Создаём или получаем комнату
                 if room_id not in rooms:
                     rooms[room_id] = Room(room_id)
                 room = rooms[room_id]
 
-                # Создаём участника
                 participant = Participant(participant_id, room, websocket)
                 room.add_participant(participant)
 
@@ -130,6 +127,9 @@ async def handle_client(websocket, path):
             elif msg_type == "leave":
                 break
 
+            else:
+                await websocket.send(json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
+
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"WebSocket closed for {participant_id}")
     except Exception as e:
@@ -142,7 +142,11 @@ async def handle_client(websocket, path):
 
 async def main():
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain("cert.pem", "key.pem")  # Укажите пути к вашим сертификатам
+    try:
+        ssl_context.load_cert_chain("cert.pem", "key.pem")
+    except FileNotFoundError:
+        logger.warning("SSL certificates not found, using unencrypted WebSocket (ws://)")
+        ssl_context = None
 
     async with websockets.serve(
         handle_client,
@@ -151,13 +155,9 @@ async def main():
         ssl=ssl_context,
         max_size=10**7,
     ):
-        logger.info("SFU server started on wss://0.0.0.0:8001")
-        await asyncio.Future()  # run forever
-
+        proto = "wss" if ssl_context else "ws"
+        logger.info(f"SFU server started on {proto}://0.0.0.0:8001")
+        await asyncio.Future()
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)

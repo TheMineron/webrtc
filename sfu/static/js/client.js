@@ -1,4 +1,4 @@
-const signalingUrl = 'wss://${window.location.host}/ws';
+const signalingUrl = 'wss://130.193.35.201:8000/ws';
 const pcConfig = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -124,9 +124,14 @@ async function connectToSFU(sfuUrl) {
                 participant_id: participantId
             }));
 
-            await setupSFUPeerConnection();
-            await startLocalStream();
-            await createAndSendOffer();
+            try {
+                await setupSFUPeerConnection();
+                await startLocalStream();
+                await createAndSendOffer();
+            } catch (err) {
+                console.error('Setup error:', err);
+                updateStatus(`Setup failed: ${err.message}`);
+            }
         };
 
         sfuSocket.onmessage = async (event) => {
@@ -170,7 +175,7 @@ async function setupSFUPeerConnection() {
     sfuPeerConnection = new RTCPeerConnection(pcConfig);
 
     sfuPeerConnection.onicecandidate = (event) => {
-        if (event.candidate && sfuSocket.readyState === WebSocket.OPEN) {
+        if (event.candidate && sfuSocket && sfuSocket.readyState === WebSocket.OPEN) {
             sfuSocket.send(JSON.stringify({
                 type: 'ice-candidate',
                 candidate: event.candidate
@@ -201,6 +206,9 @@ async function startLocalStream() {
             audio: true
         });
         addVideoElement(localStream, `${nickname} (You)`, true);
+        if (!sfuPeerConnection) {
+            throw new Error('PeerConnection not initialized');
+        }
         localStream.getTracks().forEach(track => {
             sfuPeerConnection.addTrack(track, localStream);
         });
@@ -213,6 +221,9 @@ async function startLocalStream() {
 }
 
 async function createAndSendOffer() {
+    if (!sfuPeerConnection) {
+        throw new Error('PeerConnection not initialized');
+    }
     const offer = await sfuPeerConnection.createOffer();
     await sfuPeerConnection.setLocalDescription(offer);
     sfuSocket.send(JSON.stringify({
