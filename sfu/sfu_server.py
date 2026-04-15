@@ -23,8 +23,8 @@ class SFUParticipant:
         self.websocket = websocket
         self.pc = RTCPeerConnection()
         self.relay = MediaRelay()
-        self.tracks = {}                     # kind -> track (от клиента)
-        self.remote_tracks = {}              # (source_id, kind) -> track
+        self.tracks = {}                     # kind -> track (входящие от клиента)
+        self.remote_tracks = {}              # (source_id, kind) -> track (исходящие к клиенту)
         self.reneg_lock = asyncio.Lock()
         self.reneg_task = None
         self.closed = False
@@ -33,7 +33,7 @@ class SFUParticipant:
         async def on_track(track: MediaStreamTrack):
             logger.info(f"Received {track.kind} from {self.id}")
             self.tracks[track.kind] = track
-            # Рассылаем всем остальным в комнате
+            # Рассылаем остальным в комнате
             for other_id in rooms.get(self.room_id, set()):
                 if other_id != self.id:
                     other = participants.get(other_id)
@@ -49,12 +49,12 @@ class SFUParticipant:
         if (source_id, kind) in self.remote_tracks:
             return
         self.remote_tracks[(source_id, kind)] = track
-        # Добавляем трек в PeerConnection для отправки клиенту
-        self.pc.addTrack(track)
+        # ВАЖНО: создаём новый трансивер с направлением sendonly,
+        # чтобы не модифицировать существующий аудиотрансивер клиента.
+        self.pc.addTransceiver(track, direction='sendonly')
         await self._schedule_renegotiation()
 
     async def _schedule_renegotiation(self):
-        """Планирует переговоры с небольшой задержкой, чтобы объединить несколько добавлений."""
         if self.closed:
             return
         if self.reneg_task and not self.reneg_task.done():
@@ -62,7 +62,7 @@ class SFUParticipant:
         self.reneg_task = asyncio.create_task(self._delayed_renegotiation())
 
     async def _delayed_renegotiation(self):
-        await asyncio.sleep(0.2)  # задержка для группировки
+        await asyncio.sleep(0.2)  # группируем несколько добавлений
         await self._renegotiate()
 
     async def _renegotiate(self):
