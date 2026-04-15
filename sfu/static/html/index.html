@@ -122,13 +122,8 @@
             ]
         });
 
-        // Явно создаём трансиверы для аудио и видео (sendrecv)
-        pc.addTransceiver('audio', {direction: 'sendrecv'});
-        pc.addTransceiver('video', {direction: 'sendrecv'});
-
-        // Обработка входящих треков (от других участников)
         pc.ontrack = (event) => {
-            // Используем stream.id как идентификатор участника (задаётся при добавлении трека на SFU)
+            // Используем id потока как идентификатор участника
             let remoteId = event.streams[0]?.id || 'remote';
             if (!videoElements[remoteId]) {
                 const stream = new MediaStream();
@@ -139,7 +134,7 @@
             }
         };
 
-        // Локальные медиа
+        // Локальные медиа (только видео для теста, можно включить и аудио)
         localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
         for (const track of localStream.getTracks()) {
             pc.addTrack(track, localStream);
@@ -160,23 +155,26 @@
             const msg = JSON.parse(event.data);
             if (msg.type === "answer") {
                 const answer = new RTCSessionDescription({sdp: msg.sdp, type: msg.type_sdp});
-                await pc.setRemoteDescription(answer);
-            } else if (msg.type === "renegotiate") {
-                // SFU хочет добавить новый трек
-                const offer = new RTCSessionDescription({sdp: msg.sdp, type: msg.type_sdp});
-                // Убеждаемся, что состояние позволяет setRemoteDescription
-                if (pc.signalingState !== 'stable') {
-                    console.warn("Signaling state not stable, rolling back");
-                    await pc.setLocalDescription({type: 'rollback'});
+                if (pc.signalingState === 'have-local-offer') {
+                    await pc.setRemoteDescription(answer);
                 }
-                await pc.setRemoteDescription(offer);
-                const answer = await pc.createAnswer();
-                await pc.setLocalDescription(answer);
-                sfuWs.send(JSON.stringify({
-                    type: "answer",
-                    sdp: pc.localDescription.sdp,
-                    type_sdp: pc.localDescription.type
-                }));
+            } else if (msg.type === "renegotiate") {
+                try {
+                    const offer = new RTCSessionDescription({sdp: msg.sdp, type: msg.type_sdp});
+                    if (pc.signalingState !== 'stable') {
+                        await pc.setLocalDescription({type: 'rollback'});
+                    }
+                    await pc.setRemoteDescription(offer);
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    sfuWs.send(JSON.stringify({
+                        type: "answer",
+                        sdp: pc.localDescription.sdp,
+                        type_sdp: pc.localDescription.type
+                    }));
+                } catch (err) {
+                    console.error("Renegotiation error:", err);
+                }
             } else if (msg.type === "pong") {
                 // heartbeat
             }

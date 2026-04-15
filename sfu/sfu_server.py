@@ -1,8 +1,7 @@
 import asyncio
 import json
 import logging
-import uuid
-from typing import Dict, List
+from typing import Dict, Set
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
 from aiortc.contrib.media import MediaRelay
@@ -13,28 +12,31 @@ logger = logging.getLogger("sfu")
 
 app = FastAPI()
 
-rooms: Dict[str, List["SFUParticipant"]] = {}
+rooms: Dict[str, Set[str]] = {}
+participants: Dict[str, "SFUParticipant"] = {}
 
 
 class SFUParticipant:
-    def __init__(self, room_id: str, websocket: WebSocket, participant_id: str):
+    def __init__(self, participant_id: str, room_id: str, websocket: WebSocket):
+        self.id = participant_id
         self.room_id = room_id
         self.websocket = websocket
-        self.id = participant_id
         self.pc = RTCPeerConnection()
         self.relay = MediaRelay()
-        self.incoming_tracks = {}          # kind -> track
-        self.outgoing_senders = {}          # (source_id, kind) -> RTCRtpSender
-        self.renegotiation_pending = False
+        self.tracks = {}                     # kind -> track (от клиента)
+        self.remote_tracks = {}              # (source_id, kind) -> track
+        self.reneg_pending = False
 
         @self.pc.on("track")
         async def on_track(track: MediaStreamTrack):
-            logger.info(f"Participant {self.id} sent {track.kind} track")
-            self.incoming_tracks[track.kind] = track
-            # Ретранслируем всем другим участникам комнаты
-            for other in rooms.get(self.room_id, []):
-                if other.id != self.id:
-                    await other.add_remote_track(self.id, track.kind, self.relay.subscribe(track))
+            logger.info(f"Received {track.kind} from {self.id}")
+            self.tracks[track.kind] = track
+            # Рассылаем всем остальным в комнате
+            for other_id in rooms.get(self.room_id, set()):
+                if other_id != self.id:
+                    other = participants.get(other_id)
+                    if other:
+                        await other.add_remote_track(self.id, track.kind, self.relay.subscribe(track))
 
         @self.pc.on("connectionstatechange")
         async def on_connectionstatechange():
@@ -42,58 +44,46 @@ class SFUParticipant:
                 await self.close()
 
     async def add_remote_track(self, source_id: str, kind: str, track: MediaStreamTrack):
-        """Добавить трек от другого участника в своё соединение"""
-        # Проверяем, нет ли уже такого трека
-        if (source_id, kind) in self.outgoing_senders:
-            logger.warning(f"Track {source_id}/{kind} already exists, skipping")
+        if (source_id, kind) in self.remote_tracks:
             return
-
-        # Добавляем трансивер с направлением recvonly
-        transceiver = self.pc.addTransceiver(track, direction='recvonly')
-        self.outgoing_senders[(source_id, kind)] = transceiver.sender
-        # Запускаем переговоры
+        self.remote_tracks[(source_id, kind)] = track
+        # Добавляем трек в PeerConnection для отправки клиенту
+        self.pc.addTrack(track)
         await self._renegotiate()
 
     async def _renegotiate(self):
-        """Инициировать пересмотр соединения"""
-        if self.renegotiation_pending:
+        if self.reneg_pending:
             return
-        self.renegotiation_pending = True
+        self.reneg_pending = True
         try:
-            # Убедимся, что состояние stable
             if self.pc.signalingState != 'stable':
-                logger.info(f"Signaling state {self.pc.signalingState}, waiting...")
-                # Можно подождать, но лучше просто пропустить
+                logger.info(f"Cannot renegotiate, state={self.pc.signalingState}")
                 return
-
             offer = await self.pc.createOffer()
             await self.pc.setLocalDescription(offer)
-
             await self.websocket.send_json({
                 "type": "renegotiate",
                 "sdp": self.pc.localDescription.sdp,
                 "type_sdp": self.pc.localDescription.type
             })
         except Exception as e:
-            logger.exception(f"Renegotiation failed: {e}")
+            logger.exception(f"Renegotiation error: {e}")
         finally:
-            self.renegotiation_pending = False
+            self.reneg_pending = False
 
     async def handle_answer(self, sdp: str, sdp_type: str):
-        """Применить answer от клиента"""
         if self.pc.signalingState == 'have-local-offer':
             answer = RTCSessionDescription(sdp=sdp, type=sdp_type)
             await self.pc.setRemoteDescription(answer)
-        else:
-            logger.warning(f"Unexpected signaling state for answer: {self.pc.signalingState}")
 
     async def close(self):
         if self.room_id in rooms:
-            rooms[self.room_id].remove(self)
+            rooms[self.room_id].discard(self.id)
             if not rooms[self.room_id]:
                 del rooms[self.room_id]
         await self.pc.close()
-        logger.info(f"Participant {self.id} removed")
+        participants.pop(self.id, None)
+        logger.info(f"Participant {self.id} closed")
 
 
 @app.websocket("/ws")
@@ -113,10 +103,9 @@ async def sfu_websocket(websocket: WebSocket):
             await websocket.close(code=1002)
             return
 
-        participant = SFUParticipant(room_id, websocket, participant_id)
-        rooms.setdefault(room_id, []).append(participant)
-        logger.info(f"Participant {participant_id} joined SFU room {room_id}")
-
+        participant = SFUParticipant(participant_id, room_id, websocket)
+        participants[participant_id] = participant
+        rooms.setdefault(room_id, set()).add(participant_id)
         await websocket.send_json({"type": "ready"})
 
         while True:
