@@ -151,6 +151,7 @@ async function createSFUPeerConnection() {
     }
     sfuPc.ontrack = (event) => {
         const track = event.track;
+        if (track.kind !== 'video') return;
         const stream = event.streams[0];
         console.log(`[SFU] ontrack: ${track.kind}, id=${track.id}, stream id=${stream.id}`);
         if (!remoteVideos.has(track.id)) {

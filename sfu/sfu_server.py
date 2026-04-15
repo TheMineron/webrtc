@@ -2,8 +2,8 @@ import asyncio
 import json
 import logging
 import uuid
-import ssl
 from typing import Dict, Set, Optional, List
+from fractions import Fraction
 
 import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
@@ -13,48 +13,84 @@ from websockets.legacy.server import WebSocketServerProtocol
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SFU")
 
+class RelayTrack(MediaStreamTrack):
+    """
+    Прокси-трек, который получает кадры от исходного трека и пересылает их дальше.
+    """
+    kind = "video"  # или audio, но для видео достаточно
+
+    def __init__(self, source_track: MediaStreamTrack):
+        super().__init__()
+        self.source_track = source_track
+        self._queue = asyncio.Queue()
+        self._task = asyncio.create_task(self._forward())
+
+    async def _forward(self):
+        try:
+            while True:
+                frame = await self.source_track.recv()
+                await self._queue.put(frame)
+        except Exception as e:
+            logger.error(f"RelayTrack forwarding error: {e}")
+            self._queue.put_nowait(None)
+
+    async def recv(self):
+        frame = await self._queue.get()
+        if frame is None:
+            self.stop()
+            raise StopAsyncIteration
+        return frame
+
+    def stop(self):
+        self._task.cancel()
+        super().stop()
+
 class SFURoom:
     def __init__(self, room_id: str):
         self.room_id = room_id
         self.participants: Dict[str, RTCPeerConnection] = {}
-        self.track_to_owner: Dict[MediaStreamTrack, str] = {}
-        self.participant_senders: Dict[str, Set] = {}
+        self.participant_tracks: Dict[str, List[MediaStreamTrack]] = {}  # исходящие треки для каждого участника
+        self.relay_tracks: Dict[MediaStreamTrack, RelayTrack] = {}  # исходный трек -> прокси
 
     def add_participant(self, participant_id: str, pc: RTCPeerConnection):
         self.participants[participant_id] = pc
-        self.participant_senders[participant_id] = set()
+        self.participant_tracks[participant_id] = []
         logger.info(f"[{self.room_id}] Participant {participant_id} added")
 
     def remove_participant(self, participant_id: str):
         pc = self.participants.pop(participant_id, None)
         if pc:
-            # Удаляем треки этого участника из других PeerConnection
-            tracks_to_remove = [t for t, owner in self.track_to_owner.items() if owner == participant_id]
-            for track in tracks_to_remove:
-                for other_id, other_pc in self.participants.items():
-                    if other_id != participant_id:
-                        for sender in other_pc.getSenders():
-                            if sender.track == track:
-                                other_pc.removeTrack(sender)
-                                break
-                del self.track_to_owner[track]
+            # Останавливаем и удаляем все прокси-треки, созданные для этого участника
+            for track in self.participant_tracks.get(participant_id, []):
+                track.stop()
+            self.participant_tracks.pop(participant_id, None)
+
+            # Закрываем PeerConnection
             asyncio.create_task(pc.close())
             logger.info(f"[{self.room_id}] Participant {participant_id} removed")
 
-    async def add_track_for_participant(self, participant_id: str, track: MediaStreamTrack):
-        self.track_to_owner[track] = participant_id
+    async def add_track_for_participant(self, participant_id: str, source_track: MediaStreamTrack):
+        """Создаём прокси-трек и добавляем его во всех остальных участников"""
+        # Создаём прокси для этого исходного трека (если ещё не создан)
+        if source_track not in self.relay_tracks:
+            self.relay_tracks[source_track] = RelayTrack(source_track)
+
+        relay = self.relay_tracks[source_track]
+
+        # Добавляем прокси-трек во всех остальных участников
         for other_id, other_pc in self.participants.items():
             if other_id != participant_id:
-                logger.info(f"[{self.room_id}] Adding track from {participant_id} to {other_id}")
-                sender = other_pc.addTrack(track)
-                self.participant_senders[other_id].add(sender)
+                logger.info(f"[{self.room_id}] Adding relay track from {participant_id} to {other_id}")
+                sender = other_pc.addTrack(relay)
+                # Сохраняем трек, чтобы потом его остановить
+                self.participant_tracks.setdefault(other_id, []).append(relay)
 
     async def add_existing_tracks_to_new_participant(self, new_participant_id: str, new_pc: RTCPeerConnection):
-        for track, owner_id in self.track_to_owner.items():
-            if owner_id != new_participant_id:
-                logger.info(f"[{self.room_id}] Adding existing track from {owner_id} to newcomer {new_participant_id}")
-                sender = new_pc.addTrack(track)
-                self.participant_senders[new_participant_id].add(sender)
+        """Добавляем все существующие прокси-треки новому участнику"""
+        for source_track, relay in self.relay_tracks.items():
+            logger.info(f"[{self.room_id}] Adding existing relay track to newcomer {new_participant_id}")
+            sender = new_pc.addTrack(relay)
+            self.participant_tracks.setdefault(new_participant_id, []).append(relay)
 
 rooms: Dict[str, SFURoom] = {}
 
@@ -62,7 +98,7 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
     participant_id = str(uuid.uuid4())
     current_room: Optional[SFURoom] = None
     pc: Optional[RTCPeerConnection] = None
-    pending_candidates: List = []  # список объектов RTCIceCandidate
+    pending_candidates: List = []
 
     try:
         async for message in websocket:
@@ -119,7 +155,6 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
                     "type": "answer",
                     "sdp": pc.localDescription.sdp
                 }))
-                # Добавляем накопленные ICE-кандидаты
                 if pending_candidates:
                     logger.info(f"Adding {len(pending_candidates)} pending ICE candidates for {participant_id}")
                     for candidate in pending_candidates:
@@ -128,8 +163,7 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
 
             elif msg_type == "ice-candidate" and pc:
                 candidate_data = data.get("candidate")
-                # Завершение ICE-сбора (null или пустая строка)
-                if candidate_data is None or candidate_data.get("candidate") is None or candidate_data.get("candidate") == "":
+                if candidate_data is None or candidate_data.get("candidate") is None:
                     logger.info(f"End of ICE candidates for {participant_id}")
                     continue
 
@@ -137,7 +171,6 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
                 if not candidate_sdp:
                     continue
 
-                # Используем candidate_from_sdp для создания объекта RTCIceCandidate
                 candidate = candidate_from_sdp(candidate_sdp)
                 if candidate:
                     candidate.sdpMid = candidate_data.get("sdpMid")
@@ -148,7 +181,7 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
                         logger.info(f"ICE candidate added for {participant_id}")
                     else:
                         pending_candidates.append(candidate)
-                        logger.info(f"ICE candidate buffered for {participant_id} (remote description not set)")
+                        logger.info(f"ICE candidate buffered for {participant_id}")
                 else:
                     logger.warning(f"Failed to parse ICE candidate SDP: {candidate_sdp}")
 
@@ -172,16 +205,8 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
             logger.info(f"Room {current_room.room_id} deleted (empty)")
 
 async def main():
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_context.load_cert_chain('cert.pem', 'key.pem')
-
-    async with websockets.serve(
-        sfu_websocket_handler,
-        "0.0.0.0",
-        8001,
-        ssl=ssl_context
-    ):
-        logger.info("SFU server running on wss://0.0.0.0:8001")
+    async with websockets.serve(sfu_websocket_handler, "0.0.0.0", 8001):
+        logger.info("SFU server running on ws://0.0.0.0:8001")
         await asyncio.Future()
 
 if __name__ == "__main__":
