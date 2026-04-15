@@ -13,27 +13,72 @@ from websockets.legacy.server import WebSocketServerProtocol
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SFU")
 
-class RelayTrack(MediaStreamTrack):
+# ---------------------- Fan-out трек для рассылки кадров ----------------------
+class BroadcastTrack(MediaStreamTrack):
     """
-    Прокси-трек для ретрансляции видео/аудио от одного участника всем остальным.
+    Читает кадры из source_track и копирует их во все очереди подписчиков.
     """
-    kind = "video"  # будет переопределено при создании
+    kind = "video"  # будет переопределён
 
     def __init__(self, source_track: MediaStreamTrack):
         super().__init__()
         self.kind = source_track.kind
-        self.source_track = source_track
-        self._queue = asyncio.Queue()
-        self._task = asyncio.create_task(self._forward())
+        self._source_track = source_track
+        self._subscribers: List[asyncio.Queue] = []
+        self._task = asyncio.create_task(self._broadcast())
+        self._closed = False
 
-    async def _forward(self):
+    async def _broadcast(self):
         try:
             while True:
-                frame = await self.source_track.recv()
-                await self._queue.put(frame)
+                frame = await self._source_track.recv()
+                if self._closed:
+                    break
+                # Отправляем копию кадра всем подписчикам
+                for q in self._subscribers:
+                    try:
+                        q.put_nowait(frame)
+                    except asyncio.QueueFull:
+                        logger.warning("BroadcastTrack queue full, dropping frame")
         except Exception as e:
-            logger.error(f"RelayTrack forwarding error: {e}")
-            await self._queue.put(None)
+            logger.error(f"BroadcastTrack error: {e}")
+        finally:
+            # Сигнализируем подписчикам о закрытии
+            for q in self._subscribers:
+                q.put_nowait(None)
+
+    def subscribe(self) -> asyncio.Queue:
+        """Подписывает нового получателя и возвращает его очередь."""
+        q = asyncio.Queue(maxsize=10)
+        self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue):
+        """Отписывает получателя."""
+        if q in self._subscribers:
+            self._subscribers.remove(q)
+
+    async def recv(self):
+        """Этот метод не должен вызываться напрямую — используйте подписку."""
+        raise NotImplementedError("Use subscribe()")
+
+    def stop(self):
+        self._closed = True
+        self._task.cancel()
+        super().stop()
+
+
+class RelayTrack(MediaStreamTrack):
+    """
+    Прокси-трек для каждого получателя. Получает кадры из своей очереди,
+    которая наполняется BroadcastTrack'ом.
+    """
+    kind = "video"
+
+    def __init__(self, queue: asyncio.Queue, kind: str):
+        super().__init__()
+        self.kind = kind
+        self._queue = queue
 
     async def recv(self):
         frame = await self._queue.get()
@@ -42,17 +87,15 @@ class RelayTrack(MediaStreamTrack):
             raise StopAsyncIteration
         return frame
 
-    def stop(self):
-        self._task.cancel()
-        super().stop()
 
+# ---------------------- Комната SFU ----------------------
 class SFURoom:
     def __init__(self, room_id: str):
         self.room_id = room_id
         self.participants: Dict[str, RTCPeerConnection] = {}
-        # Для каждого исходного трека создаётся один RelayTrack
-        self.relay_tracks: Dict[MediaStreamTrack, RelayTrack] = {}
-        # Для каждого участника храним список RelayTrack, которые ему отправляются (для очистки)
+        # Для каждого исходного трека храним BroadcastTrack (один на всех)
+        self.broadcast_tracks: Dict[MediaStreamTrack, BroadcastTrack] = {}
+        # Для каждого участника храним список RelayTrack (чтобы закрыть при выходе)
         self.participant_relays: Dict[str, List[RelayTrack]] = {}
 
     def add_participant(self, participant_id: str, pc: RTCPeerConnection):
@@ -62,40 +105,39 @@ class SFURoom:
 
     def remove_participant(self, participant_id: str):
         pc = self.participants.pop(participant_id, None)
+        # Закрываем все RelayTrack'ы этого участника
+        for relay in self.participant_relays.pop(participant_id, []):
+            relay.stop()
         if pc:
-            # Останавливаем и удаляем релей-треки, которые были отправлены этому участнику
-            for relay in self.participant_relays.pop(participant_id, []):
-                # Останавливаем только если этот релей-трек больше никому не нужен
-                # Упрощённо: не останавливаем, так как он может использоваться другими
-                pass
             asyncio.create_task(pc.close())
-            logger.info(f"[{self.room_id}] Participant {participant_id} removed")
-
-    async def add_track_for_participant(self, participant_id: str, source_track: MediaStreamTrack):
-        """Создаём RelayTrack (если ещё не создан) и рассылаем его всем остальным участникам."""
-        if source_track not in self.relay_tracks:
-            self.relay_tracks[source_track] = RelayTrack(source_track)
-            logger.info(f"[{self.room_id}] Created RelayTrack for {source_track.kind} from {participant_id}")
-
-        relay = self.relay_tracks[source_track]
-
-        # Добавляем этот релей-трек всем другим участникам (кроме автора)
-        for other_id, other_pc in self.participants.items():
-            if other_id == participant_id:
-                continue
-            logger.info(f"[{self.room_id}] Adding relay track from {participant_id} to {other_id}")
-            # Используем addTransceiver с явным направлением sendonly
-            transceiver = other_pc.addTransceiver(relay, direction="sendonly")
-            # Сохраняем relay в список для этого участника (для возможной очистки)
-            self.participant_relays.setdefault(other_id, []).append(relay)
+        logger.info(f"[{self.room_id}] Participant {participant_id} removed")
 
     async def add_existing_tracks_to_new_participant(self, new_participant_id: str, new_pc: RTCPeerConnection):
-        """Добавляем все существующие RelayTrack новому участнику."""
-        for source_track, relay in self.relay_tracks.items():
-            logger.info(f"[{self.room_id}] Adding existing relay track to newcomer {new_participant_id}")
-            transceiver = new_pc.addTransceiver(relay, direction="sendonly")
+        """Добавляет все существующие BroadcastTrack'и новому участнику (до установки remote description)."""
+        for source_track, broadcast in self.broadcast_tracks.items():
+            # Подписываемся на BroadcastTrack
+            queue = broadcast.subscribe()
+            relay = RelayTrack(queue, broadcast.kind)
+            # Добавляем трек в peer connection нового участника
+            new_pc.addTrack(relay)
             self.participant_relays.setdefault(new_participant_id, []).append(relay)
+            logger.info(f"[{self.room_id}] Added existing {broadcast.kind} relay to newcomer {new_participant_id}")
 
+    async def add_track_from_participant(self, participant_id: str, source_track: MediaStreamTrack):
+        """
+        Вызывается, когда участник опубликовал новый трек.
+        Создаёт BroadcastTrack (если ещё не создан) и сохраняет его для будущих участников.
+        """
+        if source_track not in self.broadcast_tracks:
+            broadcast = BroadcastTrack(source_track)
+            self.broadcast_tracks[source_track] = broadcast
+            logger.info(f"[{self.room_id}] Created BroadcastTrack for {source_track.kind} from {participant_id}")
+
+        # Примечание: уже подключённым участникам этот трек НЕ отправляется,
+        # чтобы избежать renegotiation. Новые участники получат его при подключении.
+
+
+# ---------------------- WebSocket обработчик SFU ----------------------
 rooms: Dict[str, SFURoom] = {}
 
 async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
@@ -114,15 +156,19 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
                 if not room_id:
                     await websocket.send(json.dumps({"type": "error", "message": "room required"}))
                     continue
+
                 if room_id not in rooms:
                     rooms[room_id] = SFURoom(room_id)
                 current_room = rooms[room_id]
+
                 pc = RTCPeerConnection()
 
+                # Обработка входящих треков от участника
                 @pc.on("track")
                 def on_track(track):
                     logger.info(f"[{current_room.room_id}] Received track {track.kind} from {participant_id}")
-                    asyncio.create_task(current_room.add_track_for_participant(participant_id, track))
+                    # Сохраняем трек для будущих участников (но не рассылаем текущим)
+                    asyncio.create_task(current_room.add_track_from_participant(participant_id, track))
 
                 @pc.on("iceconnectionstatechange")
                 def on_ice_state():
@@ -146,20 +192,28 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
                         except:
                             pass
 
+                # 1) Добавляем участника в комнату
                 current_room.add_participant(participant_id, pc)
+
+                # 2) Добавляем все существующие треки ДО того, как получим offer
+                await current_room.add_existing_tracks_to_new_participant(participant_id, pc)
+
                 await websocket.send(json.dumps({"type": "joined", "participant_id": participant_id}))
 
             elif msg_type == "offer" and pc and current_room:
                 offer = RTCSessionDescription(sdp=data["sdp"], type="offer")
                 await pc.setRemoteDescription(offer)
-                # Добавляем существующие треки новому участнику до создания answer
-                await current_room.add_existing_tracks_to_new_participant(participant_id, pc)
+
+                # 3) Создаём answer (больше не добавляем треки)
                 answer = await pc.createAnswer()
                 await pc.setLocalDescription(answer)
+
                 await websocket.send(json.dumps({
                     "type": "answer",
                     "sdp": pc.localDescription.sdp
                 }))
+
+                # Добавляем отложенные ICE-кандидаты
                 if pending_candidates:
                     logger.info(f"Adding {len(pending_candidates)} pending ICE candidates for {participant_id}")
                     for candidate in pending_candidates:
@@ -209,6 +263,7 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
             rooms.pop(current_room.room_id, None)
             logger.info(f"Room {current_room.room_id} deleted (empty)")
 
+# ---------------------- Запуск сервера ----------------------
 async def main():
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.load_cert_chain('cert.pem', 'key.pem')
