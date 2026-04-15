@@ -81,7 +81,7 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
                 @pc.on("track")
                 def on_track(track):
                     logger.info(f"[{current_room.room_id}] Received track {track.kind} from {participant_id}")
-                    asyncio.create_task(current_room.publish_track(participant_id, track))
+                    current_room.publish_track(participant_id, track)
 
                 @pc.on("iceconnectionstatechange")
                 def on_ice_state():
