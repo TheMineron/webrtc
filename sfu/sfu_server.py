@@ -25,7 +25,9 @@ class SFUParticipant:
         self.relay = MediaRelay()
         self.tracks = {}                     # kind -> track (от клиента)
         self.remote_tracks = {}              # (source_id, kind) -> track
-        self.reneg_pending = False
+        self.reneg_lock = asyncio.Lock()
+        self.reneg_task = None
+        self.closed = False
 
         @self.pc.on("track")
         async def on_track(track: MediaStreamTrack):
@@ -49,27 +51,37 @@ class SFUParticipant:
         self.remote_tracks[(source_id, kind)] = track
         # Добавляем трек в PeerConnection для отправки клиенту
         self.pc.addTrack(track)
+        await self._schedule_renegotiation()
+
+    async def _schedule_renegotiation(self):
+        """Планирует переговоры с небольшой задержкой, чтобы объединить несколько добавлений."""
+        if self.closed:
+            return
+        if self.reneg_task and not self.reneg_task.done():
+            self.reneg_task.cancel()
+        self.reneg_task = asyncio.create_task(self._delayed_renegotiation())
+
+    async def _delayed_renegotiation(self):
+        await asyncio.sleep(0.2)  # задержка для группировки
         await self._renegotiate()
 
     async def _renegotiate(self):
-        if self.reneg_pending:
-            return
-        self.reneg_pending = True
-        try:
+        async with self.reneg_lock:
+            if self.closed:
+                return
             if self.pc.signalingState != 'stable':
                 logger.info(f"Cannot renegotiate, state={self.pc.signalingState}")
                 return
-            offer = await self.pc.createOffer()
-            await self.pc.setLocalDescription(offer)
-            await self.websocket.send_json({
-                "type": "renegotiate",
-                "sdp": self.pc.localDescription.sdp,
-                "type_sdp": self.pc.localDescription.type
-            })
-        except Exception as e:
-            logger.exception(f"Renegotiation error: {e}")
-        finally:
-            self.reneg_pending = False
+            try:
+                offer = await self.pc.createOffer()
+                await self.pc.setLocalDescription(offer)
+                await self.websocket.send_json({
+                    "type": "renegotiate",
+                    "sdp": self.pc.localDescription.sdp,
+                    "type_sdp": self.pc.localDescription.type
+                })
+            except Exception as e:
+                logger.exception(f"Renegotiation error: {e}")
 
     async def handle_answer(self, sdp: str, sdp_type: str):
         if self.pc.signalingState == 'have-local-offer':
@@ -77,6 +89,7 @@ class SFUParticipant:
             await self.pc.setRemoteDescription(answer)
 
     async def close(self):
+        self.closed = True
         if self.room_id in rooms:
             rooms[self.room_id].discard(self.id)
             if not rooms[self.room_id]:

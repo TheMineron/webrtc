@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="ru">
 <head>
   <title>SFU Video Conference</title>
   <style>
@@ -8,12 +8,10 @@
           margin: 5px;
           background: black;
       }
-
       #videos {
           display: flex;
           flex-wrap: wrap;
       }
-
       .controls {
           margin: 10px;
       }
@@ -36,6 +34,7 @@
     let roomId = null;
     let participantId = null;
     let sfuUrl = null;
+    let isNegotiating = false;  // флаг для предотвращения пересекающихся переговоров
 
     const videosContainer = document.getElementById('videos');
     const videoElements = {};
@@ -105,12 +104,11 @@
             };
         });
 
-        // Настройка PeerConnection
+        // Настройка PeerConnection с указанием кодеков (приоритет Opus для аудио)
         pc = new RTCPeerConnection({
             iceServers: [
                 {urls: 'stun:stun.l.google.com:19302'},
                 {urls: 'stun:stun1.l.google.com:19302'},
-
                 {
                     urls: [
                         'turn:178.154.213.197:3478?transport=udp',
@@ -119,22 +117,23 @@
                     username: 'webrtc',
                     credential: 'webrtc_password'
                 }
-            ]
+            ],
+            // Указываем, что хотим получать аудио и видео (для совместимости)
+            sdpSemantics: 'unified-plan'
         });
 
         pc.ontrack = (event) => {
-            // Используем id потока как идентификатор участника
-            let remoteId = event.streams[0]?.id || 'remote';
+            const stream = event.streams[0];
+            if (!stream) return;
+            const remoteId = stream.id; // ID потока соответствует ID участника
             if (!videoElements[remoteId]) {
-                const stream = new MediaStream();
-                stream.addTrack(event.track);
                 addVideoElement(remoteId, stream);
             } else {
-                videoElements[remoteId].srcObject.addTrack(event.track);
+                // Поток уже существует, дорожки добавляются автоматически
             }
         };
 
-        // Локальные медиа (только видео для теста, можно включить и аудио)
+        // Локальные медиа
         localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
         for (const track of localStream.getTracks()) {
             pc.addTrack(track, localStream);
@@ -159,26 +158,38 @@
                     await pc.setRemoteDescription(answer);
                 }
             } else if (msg.type === "renegotiate") {
-                try {
-                    const offer = new RTCSessionDescription({sdp: msg.sdp, type: msg.type_sdp});
-                    if (pc.signalingState !== 'stable') {
-                        await pc.setLocalDescription({type: 'rollback'});
-                    }
-                    await pc.setRemoteDescription(offer);
-                    const answer = await pc.createAnswer();
-                    await pc.setLocalDescription(answer);
-                    sfuWs.send(JSON.stringify({
-                        type: "answer",
-                        sdp: pc.localDescription.sdp,
-                        type_sdp: pc.localDescription.type
-                    }));
-                } catch (err) {
-                    console.error("Renegotiation error:", err);
-                }
+                await handleRenegotiation(msg);
             } else if (msg.type === "pong") {
                 // heartbeat
             }
         };
+
+        async function handleRenegotiation(msg) {
+            if (isNegotiating) {
+                console.warn("Renegotiation already in progress, skipping...");
+                return;
+            }
+            isNegotiating = true;
+            try {
+                const offer = new RTCSessionDescription({sdp: msg.sdp, type: msg.type_sdp});
+                // Ждём стабильного состояния
+                while (pc.signalingState !== 'stable') {
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                }
+                await pc.setRemoteDescription(offer);
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                sfuWs.send(JSON.stringify({
+                    type: "answer",
+                    sdp: pc.localDescription.sdp,
+                    type_sdp: pc.localDescription.type
+                }));
+            } catch (err) {
+                console.error("Renegotiation error:", err);
+            } finally {
+                isNegotiating = false;
+            }
+        }
 
         // Heartbeat
         setInterval(() => {
