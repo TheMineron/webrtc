@@ -1,206 +1,225 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>SFU Video Conference</title>
-    <style>
-        video { width: 300px; margin: 5px; background: black; }
-        #videos { display: flex; flex-wrap: wrap; }
-        .controls { margin: 10px; }
-    </style>
+  <title>SFU Video Conference</title>
+  <style>
+      video {
+          width: 300px;
+          margin: 5px;
+          background: black;
+      }
+
+      #videos {
+          display: flex;
+          flex-wrap: wrap;
+      }
+
+      .controls {
+          margin: 10px;
+      }
+  </style>
 </head>
 <body>
-    <div class="controls">
-        <input type="text" id="room" placeholder="Room name" />
-        <input type="text" id="nickname" placeholder="Your name" />
-        <button id="join">Join room</button>
-        <button id="leave" disabled>Leave</button>
-    </div>
-    <div id="videos"></div>
+<div class="controls">
+  <input type="text" id="room" placeholder="Room name"/>
+  <input type="text" id="nickname" placeholder="Your name"/>
+  <button id="join">Join room</button>
+  <button id="leave" disabled>Leave</button>
+</div>
+<div id="videos"></div>
 
-    <script>
-        let signalingWs = null;
-        let sfuWs = null;
-        let pc = null;
-        let localStream = null;
-        let roomId = null;
-        let participantId = null;
-        let sfuUrl = null;
+<script>
+    let signalingWs = null;
+    let sfuWs = null;
+    let pc = null;
+    let localStream = null;
+    let roomId = null;
+    let participantId = null;
+    let sfuUrl = null;
 
-        // Отображение видео
-        const videosContainer = document.getElementById('videos');
-        const videoElements = {}; // participantId -> HTMLVideoElement
+    const videosContainer = document.getElementById('videos');
+    const videoElements = {};
 
-        function addVideoElement(participantId, stream, isLocal = false) {
-            if (videoElements[participantId]) return;
-            const video = document.createElement('video');
-            video.id = `video-${participantId}`;
-            video.srcObject = stream;
-            video.autoplay = true;
-            video.playsInline = true;
-            if (isLocal) video.muted = true;
-            videosContainer.appendChild(video);
-            videoElements[participantId] = video;
+    function addVideoElement(participantId, stream, isLocal = false) {
+        if (videoElements[participantId]) return;
+        const video = document.createElement('video');
+        video.id = `video-${participantId}`;
+        video.srcObject = stream;
+        video.autoplay = true;
+        video.playsInline = true;
+        if (isLocal) video.muted = true;
+        videosContainer.appendChild(video);
+        videoElements[participantId] = video;
+    }
+
+    function removeVideoElement(participantId) {
+        const video = videoElements[participantId];
+        if (video) {
+            video.remove();
+            delete videoElements[participantId];
         }
+    }
 
-        function removeVideoElement(participantId) {
-            const video = videoElements[participantId];
-            if (video) {
-                video.remove();
-                delete videoElements[participantId];
-            }
-        }
-
-        // Подключение к сигнальному серверу
-        function connectSignaling(room, nickname) {
-            return new Promise((resolve, reject) => {
-                signalingWs = new WebSocket(`wss://${window.location.hostname}:8000/ws`);
-                signalingWs.onopen = () => {
-                    signalingWs.send(JSON.stringify({
-                        type: "join",
-                        room: room,
-                        nickname: nickname
-                    }));
-                };
-                signalingWs.onmessage = (event) => {
-                    const msg = JSON.parse(event.data);
-                    if (msg.type === "joined") {
-                        roomId = msg.room;
-                        participantId = msg.participant_id;
-                        sfuUrl = msg.sfu_url;    // например, "ws://localhost:8001/ws"
-                        resolve();
-                    } else if (msg.type === "participant_joined") {
-                        // Другой участник зашёл – не нужно ничего делать, SFU сам пришлёт треки
-                    } else if (msg.type === "participant_left") {
-                        removeVideoElement(msg.participant_id);
-                    } else if (msg.type === "pong") {
-                        // heartbeat
-                    }
-                };
-                signalingWs.onerror = reject;
-            });
-        }
-
-        // Подключение к SFU и установка PeerConnection
-        async function connectSFU() {
-            sfuWs = new WebSocket(sfuUrl);
-            await new Promise((resolve, reject) => {
-                sfuWs.onopen = resolve;
-                sfuWs.onerror = reject;
-            });
-
-            // Отправляем join-сообщение SFU
-            sfuWs.send(JSON.stringify({
-                type: "join",
-                room: roomId,
-                participant_id: participantId
-            }));
-
-            // Ждём ready от SFU
-            await new Promise((resolve) => {
-                sfuWs.onmessage = (event) => {
-                    const msg = JSON.parse(event.data);
-                    if (msg.type === "ready") resolve();
-                };
-            });
-
-            // Создаём PeerConnection
-            pc = new RTCPeerConnection({
-                iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-            });
-
-            // Обработка входящих треков (от других участников)
-            pc.ontrack = (event) => {
-                const [participantIdFromTrack] = event.track.id.split('|'); // или другой способ идентификации
-                // Для простоты используем stream.id как participantId (можно задать при добавлении трека на SFU)
-                let remoteId = event.streams[0]?.id || participantIdFromTrack;
-                if (!videoElements[remoteId]) {
-                    const stream = new MediaStream();
-                    stream.addTrack(event.track);
-                    addVideoElement(remoteId, stream);
-                } else {
-                    videoElements[remoteId].srcObject.addTrack(event.track);
-                }
+    async function connectSignaling(room, nickname) {
+        return new Promise((resolve, reject) => {
+            signalingWs = new WebSocket(`wss://${window.location.hostname}:8000/ws`);
+            signalingWs.onopen = () => {
+                signalingWs.send(JSON.stringify({
+                    type: "join",
+                    room: room,
+                    nickname: nickname
+                }));
             };
-
-            // Добавляем локальные медиа
-            localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-            for (const track of localStream.getTracks()) {
-                pc.addTrack(track, localStream);
-            }
-            // Отображаем локальное видео
-            addVideoElement(participantId, localStream, true);
-
-            // Создаём offer и отправляем SFU
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            sfuWs.send(JSON.stringify({
-                type: "offer",
-                sdp: pc.localDescription.sdp,
-                type_sdp: pc.localDescription.type
-            }));
-
-            // Обработка ответа от SFU
-            sfuWs.onmessage = async (event) => {
+            signalingWs.onmessage = (event) => {
                 const msg = JSON.parse(event.data);
-                if (msg.type === "answer") {
-                    const answer = new RTCSessionDescription({ sdp: msg.sdp, type: msg.type_sdp });
-                    await pc.setRemoteDescription(answer);
-                } else if (msg.type === "renegotiate") {
-                    // SFU добавляет новый трек (другой участник присоединился)
-                    const offer = new RTCSessionDescription({ sdp: msg.sdp, type: msg.type_sdp });
-                    await pc.setRemoteDescription(offer);
-                    const answer = await pc.createAnswer();
-                    await pc.setLocalDescription(answer);
-                    sfuWs.send(JSON.stringify({
-                        type: "answer",
-                        sdp: pc.localDescription.sdp,
-                        type_sdp: pc.localDescription.type
-                    }));
-                } else if (msg.type === "pong") {
-                    // heartbeat
+                if (msg.type === "joined") {
+                    roomId = msg.room;
+                    participantId = msg.participant_id;
+                    sfuUrl = msg.sfu_url;
+                    resolve();
+                } else if (msg.type === "participant_left") {
+                    removeVideoElement(msg.participant_id);
                 }
             };
+            signalingWs.onerror = reject;
+        });
+    }
 
-            // Периодический ping (heartbeat)
-            setInterval(() => {
-                if (sfuWs && sfuWs.readyState === WebSocket.OPEN) {
-                    sfuWs.send(JSON.stringify({ type: "ping" }));
+    async function connectSFU() {
+        sfuWs = new WebSocket(sfuUrl);
+        await new Promise((resolve, reject) => {
+            sfuWs.onopen = resolve;
+            sfuWs.onerror = reject;
+        });
+
+        sfuWs.send(JSON.stringify({
+            type: "join",
+            room: roomId,
+            participant_id: participantId
+        }));
+
+        await new Promise((resolve) => {
+            sfuWs.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                if (msg.type === "ready") resolve();
+            };
+        });
+
+        // Настройка PeerConnection
+        pc = new RTCPeerConnection({
+            iceServers: [
+                {urls: 'stun:stun.l.google.com:19302'},
+                {urls: 'stun:stun1.l.google.com:19302'},
+
+                {
+                    urls: [
+                        'turn:178.154.213.197:3478?transport=udp',
+                        'turn:178.154.213.197:3478?transport=tcp'
+                    ],
+                    username: 'webrtc',
+                    credential: 'webrtc_password'
                 }
-            }, 15000);
-        }
+            ]
+        });
 
-        // Выход из комнаты
-        async function leaveRoom() {
-            if (signalingWs) signalingWs.close();
-            if (sfuWs) sfuWs.send(JSON.stringify({ type: "leave" }));
-            if (pc) pc.close();
-            if (localStream) localStream.getTracks().forEach(t => t.stop());
-            document.getElementById('join').disabled = false;
-            document.getElementById('leave').disabled = true;
-            videosContainer.innerHTML = '';
-            videoElements.length = 0;
-        }
+        // Явно создаём трансиверы для аудио и видео (sendrecv)
+        pc.addTransceiver('audio', {direction: 'sendrecv'});
+        pc.addTransceiver('video', {direction: 'sendrecv'});
 
-        // Инициализация
-        document.getElementById('join').onclick = async () => {
-            const room = document.getElementById('room').value;
-            const nickname = document.getElementById('nickname').value;
-            if (!room || !nickname) {
-                alert("Room and nickname required");
-                return;
-            }
-            document.getElementById('join').disabled = true;
-            document.getElementById('leave').disabled = false;
-            try {
-                await connectSignaling(room, nickname);
-                await connectSFU();
-            } catch (err) {
-                console.error(err);
-                alert("Connection failed");
-                leaveRoom();
+        // Обработка входящих треков (от других участников)
+        pc.ontrack = (event) => {
+            // Используем stream.id как идентификатор участника (задаётся при добавлении трека на SFU)
+            let remoteId = event.streams[0]?.id || 'remote';
+            if (!videoElements[remoteId]) {
+                const stream = new MediaStream();
+                stream.addTrack(event.track);
+                addVideoElement(remoteId, stream);
+            } else {
+                videoElements[remoteId].srcObject.addTrack(event.track);
             }
         };
-        document.getElementById('leave').onclick = () => leaveRoom();
-    </script>
+
+        // Локальные медиа
+        localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
+        for (const track of localStream.getTracks()) {
+            pc.addTrack(track, localStream);
+        }
+        addVideoElement(participantId, localStream, true);
+
+        // Первоначальный offer
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        sfuWs.send(JSON.stringify({
+            type: "offer",
+            sdp: pc.localDescription.sdp,
+            type_sdp: pc.localDescription.type
+        }));
+
+        // Обработка сообщений SFU
+        sfuWs.onmessage = async (event) => {
+            const msg = JSON.parse(event.data);
+            if (msg.type === "answer") {
+                const answer = new RTCSessionDescription({sdp: msg.sdp, type: msg.type_sdp});
+                await pc.setRemoteDescription(answer);
+            } else if (msg.type === "renegotiate") {
+                // SFU хочет добавить новый трек
+                const offer = new RTCSessionDescription({sdp: msg.sdp, type: msg.type_sdp});
+                // Убеждаемся, что состояние позволяет setRemoteDescription
+                if (pc.signalingState !== 'stable') {
+                    console.warn("Signaling state not stable, rolling back");
+                    await pc.setLocalDescription({type: 'rollback'});
+                }
+                await pc.setRemoteDescription(offer);
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                sfuWs.send(JSON.stringify({
+                    type: "answer",
+                    sdp: pc.localDescription.sdp,
+                    type_sdp: pc.localDescription.type
+                }));
+            } else if (msg.type === "pong") {
+                // heartbeat
+            }
+        };
+
+        // Heartbeat
+        setInterval(() => {
+            if (sfuWs && sfuWs.readyState === WebSocket.OPEN) {
+                sfuWs.send(JSON.stringify({type: "ping"}));
+            }
+        }, 15000);
+    }
+
+    async function leaveRoom() {
+        if (signalingWs) signalingWs.close();
+        if (sfuWs) sfuWs.send(JSON.stringify({type: "leave"}));
+        if (pc) pc.close();
+        if (localStream) localStream.getTracks().forEach(t => t.stop());
+        document.getElementById('join').disabled = false;
+        document.getElementById('leave').disabled = true;
+        videosContainer.innerHTML = '';
+        Object.keys(videoElements).forEach(k => delete videoElements[k]);
+    }
+
+    document.getElementById('join').onclick = async () => {
+        const room = document.getElementById('room').value;
+        const nickname = document.getElementById('nickname').value;
+        if (!room || !nickname) {
+            alert("Room and nickname required");
+            return;
+        }
+        document.getElementById('join').disabled = true;
+        document.getElementById('leave').disabled = false;
+        try {
+            await connectSignaling(room, nickname);
+            await connectSFU();
+        } catch (err) {
+            console.error(err);
+            alert("Connection failed");
+            leaveRoom();
+        }
+    };
+    document.getElementById('leave').onclick = () => leaveRoom();
+</script>
 </body>
 </html>

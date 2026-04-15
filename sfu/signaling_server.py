@@ -36,7 +36,7 @@ SFU_WS_URL = "wss://178.154.233.36:8001/ws"
 async def lifespan(app: FastAPI):
     async def heartbeat_checker():
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
             now = asyncio.get_event_loop().time()
             for room in list(rooms.values()):
                 for pid, participant in list(room.participants.items()):
