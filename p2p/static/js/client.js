@@ -291,12 +291,15 @@ async function handleSignal(fromId, fromName, data) {
     let pc = entry ? entry.pc : null;
     if (!pc && data.type === "offer") {
         pc = createPeerConnection(fromId, fromName);
+        entry = peerConnections.get(fromId);
     }
     if (!pc) return;
 
     try {
         if (data.type === "offer") {
-            await pc.setRemoteDescription(new RTCSessionDescription(data));
+            console.log("SDP string:", data.sdp);
+            console.log("SDP type:", data.type);
+            await pc.setRemoteDescription({ type: data.type, sdp: data.sdp });
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             ws.send(JSON.stringify({
@@ -306,11 +309,15 @@ async function handleSignal(fromId, fromName, data) {
             }));
             logStat(`Отправлен answer для ${fromName}`);
         } else if (data.type === "answer") {
-            await pc.setRemoteDescription(new RTCSessionDescription(data));
+            await pc.setRemoteDescription({ type: data.type, sdp: data.sdp });
             logStat(`Установлен remote description (answer) от ${fromName}`);
         } else if (data.type === "ice") {
-            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-            logStat(`Добавлен ICE-кандидат от ${fromName}`);
+            if (pc.remoteDescription) {
+                await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                logStat(`Добавлен ICE-кандидат от ${fromName}`);
+            } else {
+                logStat(`ICE кандидат получен до установки remote description, игнорируем`);
+            }
         }
     } catch (err) {
         console.error("Ошибка обработки сигнала:", err);
@@ -318,8 +325,8 @@ async function handleSignal(fromId, fromName, data) {
 }
 
 async function joinRoom(roomId, nickname) {
-    ws = new WebSocket(`ws://${window.location.host}/ws`);
-
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
     ws.onopen = () => {
         ws.send(JSON.stringify({ type: "join", room: roomId, nickname: nickname }));
     };
