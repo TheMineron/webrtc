@@ -140,25 +140,19 @@ async function connectToSFU(sfuUrl) {
 
             if (msg.type === 'joined') {
                 updateStatus('Joined SFU room');
-            } else if (msg.type === 'offer') {
-                // Получен повторный offer от SFU при добавлении треков
-                if (!sfuPeerConnection) {
-                    console.error('No peer connection for renegotiation offer');
-                    return;
-                }
+            } else if (msg.type === 'renegotiate') {
+                // SFU требует пересоздать offer из-за добавленных треков
+                if (!sfuPeerConnection) return;
                 try {
-                    await sfuPeerConnection.setRemoteDescription(new RTCSessionDescription({
-                        type: 'offer',
-                        sdp: msg.sdp
-                    }));
-                    const answer = await sfuPeerConnection.createAnswer();
-                    await sfuPeerConnection.setLocalDescription(answer);
+                    const offer = await sfuPeerConnection.createOffer();
+                    await sfuPeerConnection.setLocalDescription(offer);
                     sfuSocket.send(JSON.stringify({
-                        type: 'answer',
-                        sdp: answer.sdp
+                        type: 'offer',
+                        sdp: offer.sdp
                     }));
+                    updateStatus('Sent renegotiation offer');
                 } catch (err) {
-                    console.error('Renegotiation failed:', err);
+                    console.error('Failed to create renegotiation offer:', err);
                 }
             } else if (msg.type === 'answer') {
                 const answer = new RTCSessionDescription({
