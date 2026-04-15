@@ -1,16 +1,8 @@
-let signalingWs = null;
-let sfuWs = null;
-let localStream = null;
-let currentRoomId = null;
-let currentNickname = null;
-let sfuPc = null;
-let remoteVideos = new Map(); // trackId -> {video, container, label, stream}
-
+const signalingUrl = 'wss://${window.location.host}/ws';
 const pcConfig = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-
         {
             urls: [
                 'turn:178.154.213.197:3478?transport=udp',
@@ -23,234 +15,238 @@ const pcConfig = {
     iceCandidatePoolSize: 10
 };
 
-let prevStatsMap = new Map();
-setInterval(() => {
-    if (sfuPc && sfuPc.connectionState === 'connected') collectStats();
-}, 5000);
+let signalingSocket = null;
+let sfuSocket = null;
+let sfuPeerConnection = null;
+let localStream = null;
+let roomId = '';
+let participantId = '';
+let nickname = '';
 
-async function collectStats() {
-    if (!sfuPc) return;
-    const stats = await sfuPc.getStats();
-    let statsText = '';
-    let inboundRtpMap = new Map();
-    let candidatePair = null;
-    stats.forEach(report => {
-        if (report.type === 'inbound-rtp' && report.kind === 'video') {
-            inboundRtpMap.set(report.id, report);
-        }
-        if (report.type === 'candidate-pair' && report.nominated === true) {
-            candidatePair = report;
-        }
-    });
-    let totalBitrate = 0;
-    const now = Date.now();
-    for (let [id, report] of inboundRtpMap) {
-        const prev = prevStatsMap.get(id);
-        let bitrate = 0;
-        if (prev && prev.bytes !== undefined && prev.timestamp) {
-            const bytesDiff = report.bytesReceived - prev.bytes;
-            const timeDiff = (now - prev.timestamp) / 1000;
-            if (timeDiff > 0) bitrate = (bytesDiff * 8) / timeDiff / 1000;
-        }
-        prevStatsMap.set(id, {bytes: report.bytesReceived, timestamp: now});
-        totalBitrate += bitrate;
-        statsText += `📹 Bitrate: ${bitrate.toFixed(2)} kbps\n`;
-        statsText += `📦 Packets lost: ${report.packetsLost}\n`;
-        statsText += `⏱️ Jitter: ${(report.jitter || 0).toFixed(3)} s\n`;
-    }
-    if (candidatePair && candidatePair.currentRoundTripTime) {
-        statsText += `🔄 ICE RTT: ${(candidatePair.currentRoundTripTime * 1000).toFixed(2)} ms\n`;
-    }
-    if (statsText === '') statsText = 'No active video streams';
-    document.getElementById('webrtcStats').innerHTML = `<pre>${statsText}</pre>`;
+const videosContainer = document.getElementById('videos');
+const statusDiv = document.getElementById('status');
+const joinBtn = document.getElementById('joinBtn');
+const leaveBtn = document.getElementById('leaveBtn');
+const roomInput = document.getElementById('roomInput');
+const nameInput = document.getElementById('nameInput');
+
+joinBtn.onclick = joinRoom;
+leaveBtn.onclick = leaveRoom;
+
+function updateStatus(text) {
+    statusDiv.textContent = text;
+    console.log(text);
 }
 
-// ---------- Signaling ----------
-async function connectSignaling(roomId, nickname) {
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
-    signalingWs = new WebSocket(wsUrl);
-    signalingWs.onopen = () => {
-        signalingWs.send(JSON.stringify({type: 'join', room: roomId, nickname}));
-        // Heartbeat: send ping every 30 seconds
-        setInterval(() => {
-            if (signalingWs.readyState === WebSocket.OPEN) {
-                signalingWs.send(JSON.stringify({type: 'ping', timestamp: Date.now()}));
-            }
-        }, 30000);
+function addVideoElement(stream, label, isLocal = false) {
+    const video = document.createElement('video');
+    video.srcObject = stream;
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = isLocal;
+    const container = document.createElement('div');
+    container.className = 'video-container';
+    container.id = `video-${stream.id}`;
+    const labelDiv = document.createElement('div');
+    labelDiv.className = 'label';
+    labelDiv.textContent = label;
+    container.appendChild(video);
+    container.appendChild(labelDiv);
+    videosContainer.appendChild(container);
+    return video;
+}
+
+function removeVideoElement(streamId) {
+    const elem = document.getElementById(`video-${streamId}`);
+    if (elem) elem.remove();
+}
+
+async function joinRoom() {
+    roomId = roomInput.value.trim();
+    nickname = nameInput.value.trim();
+    if (!roomId || !nickname) {
+        alert('Room and name are required');
+        return;
+    }
+
+    joinBtn.disabled = true;
+    updateStatus('Connecting to signaling server...');
+
+    signalingSocket = new WebSocket(signalingUrl);
+    signalingSocket.onopen = () => {
+        updateStatus('Signaling connected, joining room...');
+        signalingSocket.send(JSON.stringify({
+            type: 'join',
+            room: roomId,
+            nickname: nickname
+        }));
     };
-    signalingWs.onmessage = async (e) => {
-        const msg = JSON.parse(e.data);
-        console.log('[Signaling]', msg.type, msg);
+
+    signalingSocket.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
+        console.log('Signaling message:', msg);
+
         if (msg.type === 'joined') {
-            currentRoomId = msg.room;
-            currentNickname = msg.nickname;
-            document.getElementById('join-screen').style.display = 'none';
-            document.getElementById('video-grid').style.display = 'flex';
-            await initLocalMedia();
-            connectToSFU(msg.sfu_url, msg.room);
-        } else if (msg.type === 'pong') {
-            const rtt = Date.now() - msg.timestamp;
-            document.getElementById('latencyResult').innerHTML = `<pre>⏱️ Signaling RTT: ${rtt} ms</pre>`;
-        } else if (msg.type === 'error') {
-            alert(msg.message);
+            participantId = msg.participant_id;
+            const sfuUrl = msg.sfu_url;
+            updateStatus(`Joined room ${roomId}, connecting to SFU...`);
+            await connectToSFU(sfuUrl);
         } else if (msg.type === 'participant_joined') {
-            console.log('Participant joined:', msg.participant);
-            // Можно показать уведомление, но SFU сам управляет потоками
+            updateStatus(`Participant ${msg.participant.name} joined`);
         } else if (msg.type === 'participant_left') {
-            console.log('Participant left:', msg.participant_id);
-        }
-    };
-    signalingWs.onerror = (err) => console.error('Signaling error', err);
-    signalingWs.onclose = () => console.log('Signaling closed');
-}
-
-// ---------- SFU Connection ----------
-function connectToSFU(sfuUrl, roomId) {
-    sfuWs = new WebSocket(sfuUrl);
-    sfuWs.onopen = () => {
-        sfuWs.send(JSON.stringify({type: 'join', room: roomId}));
-        // Heartbeat for SFU
-        setInterval(() => {
-            if (sfuWs.readyState === WebSocket.OPEN) {
-                sfuWs.send(JSON.stringify({type: 'ping', timestamp: Date.now()}));
-            }
-        }, 30000);
-    };
-    sfuWs.onmessage = async (e) => {
-        const msg = JSON.parse(e.data);
-        console.log('[SFU]', msg.type, msg);
-        if (msg.type === 'joined') {
-            await createSFUPeerConnection();
-        } else if (msg.type === 'answer') {
-            await sfuPc.setRemoteDescription(new RTCSessionDescription({type: 'answer', sdp: msg.sdp}));
-        } else if (msg.type === 'ice-candidate') {
-            await sfuPc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-        } else if (msg.type === 'pong') {
-            const rtt = Date.now() - msg.timestamp;
-            console.log(`SFU RTT: ${rtt} ms`);
+            updateStatus(`Participant ${msg.participant_id} left`);
         } else if (msg.type === 'error') {
-            alert('SFU error: ' + msg.message);
+            console.error('Signaling error:', msg.message);
+            updateStatus(`Error: ${msg.message}`);
         }
     };
-    sfuWs.onerror = (err) => console.error('SFU WebSocket error', err);
-    sfuWs.onclose = () => {
-        console.log('SFU WebSocket closed');
-        if (sfuPc) sfuPc.close();
+
+    signalingSocket.onerror = (err) => {
+        console.error('Signaling WebSocket error:', err);
+        updateStatus('Signaling connection error');
+    };
+
+    signalingSocket.onclose = () => {
+        updateStatus('Signaling connection closed');
+        joinBtn.disabled = false;
+        leaveBtn.disabled = true;
     };
 }
 
-async function createSFUPeerConnection() {
-    sfuPc = new RTCPeerConnection(pcConfig);
-    // Добавляем локальные треки
-    if (localStream) {
-        localStream.getTracks().forEach(track => {
-            sfuPc.addTrack(track, localStream);
-            console.log(`Added local ${track.kind} track to SFU PC`);
-        });
-    }
-    sfuPc.ontrack = (event) => {
-        const track = event.track;
-        if (track.kind !== 'video') return;
-        const stream = event.streams[0];
-        console.log(`[SFU] ontrack: ${track.kind}, id=${track.id}, stream id=${stream.id}`);
-        if (!remoteVideos.has(track.id)) {
-            const container = document.createElement('div');
-            container.className = 'video-container';
-            const video = document.createElement('video');
-            video.autoplay = true;
-            video.playsInline = true;
-            video.srcObject = stream;
-            const label = document.createElement('div');
-            label.className = 'label';
-            label.textContent = `Peer ${track.id.slice(0, 6)}`;
-            container.appendChild(video);
-            container.appendChild(label);
-            document.getElementById('remoteVideos').appendChild(container);
-            remoteVideos.set(track.id, {video, container, label, stream});
-        } else {
-            // Обновляем, если stream изменился (редко)
-            const entry = remoteVideos.get(track.id);
-            if (entry.video.srcObject !== stream) {
-                entry.video.srcObject = stream;
-            }
-        }
-    };
-
-    sfuPc.onicecandidate = (event) => {
-        if (event.candidate) {
-            sfuWs.send(JSON.stringify({
-                type: 'ice-candidate',
-                candidate: {
-                    candidate: event.candidate.candidate,  // SDP-строка кандидата
-                    sdpMid: event.candidate.sdpMid,
-                    sdpMLineIndex: event.candidate.sdpMLineIndex
-                }
-            }));
-        } else {
-            // Сигнал о завершении ICE-сбора
-            sfuWs.send(JSON.stringify({
-                type: 'ice-candidate',
-                candidate: null
-            }));
-        }
-    };
-    sfuPc.oniceconnectionstatechange = () => {
-        console.log(`ICE connection state: ${sfuPc.iceConnectionState}`);
-    };
-    sfuPc.onconnectionstatechange = () => {
-        console.log(`Connection state: ${sfuPc.connectionState}`);
-    };
-    const offer = await sfuPc.createOffer();
-    await sfuPc.setLocalDescription(offer);
-    sfuWs.send(JSON.stringify({type: 'offer', sdp: offer.sdp}));
-}
-
-// ---------- Local Media ----------
-async function initLocalMedia() {
+async function connectToSFU(sfuUrl) {
     try {
-        localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
-        document.getElementById('localVideo').srcObject = localStream;
-        console.log('Local stream obtained');
+        sfuSocket = new WebSocket(sfuUrl);
+        sfuSocket.onopen = async () => {
+            updateStatus('SFU connected, setting up WebRTC...');
+            sfuSocket.send(JSON.stringify({
+                type: 'join',
+                room: roomId,
+                participant_id: participantId
+            }));
+
+            await setupSFUPeerConnection();
+            await startLocalStream();
+            await createAndSendOffer();
+        };
+
+        sfuSocket.onmessage = async (event) => {
+            const msg = JSON.parse(event.data);
+            console.log('SFU message:', msg);
+
+            if (msg.type === 'joined') {
+                updateStatus('Joined SFU room');
+            } else if (msg.type === 'answer') {
+                const answer = new RTCSessionDescription({
+                    type: 'answer',
+                    sdp: msg.sdp
+                });
+                await sfuPeerConnection.setRemoteDescription(answer);
+                updateStatus('WebRTC connection established');
+            } else if (msg.type === 'ice-candidate') {
+                const candidate = new RTCIceCandidate(msg.candidate);
+                await sfuPeerConnection.addIceCandidate(candidate);
+            } else if (msg.type === 'error') {
+                console.error('SFU error:', msg.message);
+                updateStatus(`SFU error: ${msg.message}`);
+            }
+        };
+
+        sfuSocket.onerror = (err) => {
+            console.error('SFU WebSocket error:', err);
+            updateStatus('SFU connection error');
+        };
+
+        sfuSocket.onclose = () => {
+            updateStatus('SFU connection closed');
+            cleanup();
+        };
     } catch (err) {
-        console.error('Media error:', err);
-        alert('Cannot access camera/microphone');
+        console.error('Failed to connect to SFU:', err);
+        updateStatus('Failed to connect to SFU');
     }
 }
 
-// UI controls
-document.getElementById('joinBtn').onclick = () => {
-    const nickname = document.getElementById('nickname').value.trim();
-    const roomId = document.getElementById('roomId').value.trim();
-    if (!nickname || !roomId) return alert('Fill all fields');
-    connectSignaling(roomId, nickname);
-};
-document.getElementById('startLatencyTestBtn').onclick = () => {
-    if (signalingWs && signalingWs.readyState === WebSocket.OPEN) {
-        signalingWs.send(JSON.stringify({type: 'ping', timestamp: Date.now()}));
-        document.getElementById('latencyResult').innerHTML = '<pre>Measuring...</pre>';
-    } else {
-        alert('Not connected');
-    }
-};
-let micEnabled = true, camEnabled = true;
-document.getElementById('toggleMicBtn').onclick = () => {
-    if (localStream) {
-        const audioTracks = localStream.getAudioTracks();
-        if (audioTracks.length) {
-            micEnabled = !micEnabled;
-            audioTracks[0].enabled = micEnabled;
-            document.getElementById('toggleMicBtn').textContent = micEnabled ? '🎤 Mute Mic' : '🎤 Unmute Mic';
+async function setupSFUPeerConnection() {
+    sfuPeerConnection = new RTCPeerConnection(pcConfig);
+
+    sfuPeerConnection.onicecandidate = (event) => {
+        if (event.candidate && sfuSocket.readyState === WebSocket.OPEN) {
+            sfuSocket.send(JSON.stringify({
+                type: 'ice-candidate',
+                candidate: event.candidate
+            }));
         }
-    }
-};
-document.getElementById('toggleCamBtn').onclick = () => {
-    if (localStream) {
-        const videoTracks = localStream.getVideoTracks();
-        if (videoTracks.length) {
-            camEnabled = !camEnabled;
-            videoTracks[0].enabled = camEnabled;
-            document.getElementById('toggleCamBtn').textContent = camEnabled ? '📷 Mute Camera' : '📷 Unmute Camera';
+    };
+
+    sfuPeerConnection.ontrack = (event) => {
+        console.log('Remote track received:', event.track.kind);
+        const stream = event.streams[0];
+        if (stream) {
+            addVideoElement(stream, `Remote (${stream.id.slice(0, 8)})`);
         }
+    };
+
+    sfuPeerConnection.onconnectionstatechange = () => {
+        updateStatus(`SFU connection state: ${sfuPeerConnection.connectionState}`);
+        if (sfuPeerConnection.connectionState === 'failed') {
+            updateStatus('SFU connection failed');
+        }
+    };
+}
+
+async function startLocalStream() {
+    try {
+        localStream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true
+        });
+        addVideoElement(localStream, `${nickname} (You)`, true);
+        localStream.getTracks().forEach(track => {
+            sfuPeerConnection.addTrack(track, localStream);
+        });
+        updateStatus('Local stream started');
+    } catch (err) {
+        console.error('Failed to get local media:', err);
+        updateStatus('Failed to access camera/microphone');
+        throw err;
     }
-};
+}
+
+async function createAndSendOffer() {
+    const offer = await sfuPeerConnection.createOffer();
+    await sfuPeerConnection.setLocalDescription(offer);
+    sfuSocket.send(JSON.stringify({
+        type: 'offer',
+        sdp: sfuPeerConnection.localDescription.sdp
+    }));
+    updateStatus('Offer sent to SFU');
+    leaveBtn.disabled = false;
+}
+
+function cleanup() {
+    if (sfuPeerConnection) {
+        sfuPeerConnection.close();
+        sfuPeerConnection = null;
+    }
+    if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
+        localStream = null;
+    }
+    if (sfuSocket) {
+        sfuSocket.close();
+        sfuSocket = null;
+    }
+    videosContainer.innerHTML = '';
+    joinBtn.disabled = false;
+    leaveBtn.disabled = true;
+}
+
+function leaveRoom() {
+    if (signalingSocket) {
+        signalingSocket.send(JSON.stringify({ type: 'leave' }));
+        signalingSocket.close();
+        signalingSocket = null;
+    }
+    cleanup();
+    updateStatus('Disconnected');
+}

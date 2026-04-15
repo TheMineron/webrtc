@@ -1,169 +1,31 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>SFU Video Conference</title>
-  <style>
-    video { width: 300px; margin: 5px; background: black; }
-    #videos { display: flex; flex-wrap: wrap; }
-    .controls { margin: 10px; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SFU WebRTC Demo</title>
+    <style>
+        body { font-family: sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .controls { margin-bottom: 20px; }
+        input, button { padding: 8px 12px; font-size: 16px; margin-right: 10px; }
+        #videos { display: flex; flex-wrap: wrap; gap: 10px; }
+        video { width: 300px; height: 200px; background: #333; object-fit: cover; border-radius: 8px; }
+        .video-container { position: relative; }
+        .label { position: absolute; bottom: 5px; left: 5px; color: white; background: rgba(0,0,0,0.5); padding: 2px 6px; border-radius: 4px; }
+        #status { margin: 10px 0; color: #666; }
+    </style>
 </head>
 <body>
-<div class="controls">
-  <input type="text" id="room" placeholder="Room name" />
-  <input type="text" id="nickname" placeholder="Your name" />
-  <button id="join">Join room</button>
-  <button id="leave" disabled>Leave</button>
-</div>
-<div id="videos"></div>
+    <h1>SFU Video Conference</h1>
+    <div class="controls">
+        <input type="text" id="roomInput" placeholder="Room ID" value="test-room">
+        <input type="text" id="nameInput" placeholder="Your Name" value="User">
+        <button id="joinBtn">Join Room</button>
+        <button id="leaveBtn" disabled>Leave</button>
+    </div>
+    <div id="status">Not connected</div>
+    <div id="videos"></div>
 
-<script>
-  let signalingWs = null, sfuWs = null, pc = null;
-  let localStream = null, roomId = null, participantId = null, sfuUrl = null;
-  let isRenegotiating = false;
-  const videosContainer = document.getElementById('videos');
-  const videoElements = {};
-
-  function addVideoElement(pid, stream, isLocal = false) {
-    if (videoElements[pid]) return;
-    const video = document.createElement('video');
-    video.id = `video-${pid}`;
-    video.srcObject = stream;
-    video.autoplay = true;
-    video.playsInline = true;
-    if (isLocal) video.muted = true;
-    videosContainer.appendChild(video);
-    videoElements[pid] = video;
-  }
-
-  function removeVideoElement(pid) {
-    const video = videoElements[pid];
-    if (video) { video.remove(); delete videoElements[pid]; }
-  }
-
-  async function connectSignaling(room, nickname) {
-    return new Promise((resolve, reject) => {
-      signalingWs = new WebSocket(`wss://${location.hostname}:8000/ws`);
-      signalingWs.onopen = () => signalingWs.send(JSON.stringify({ type: 'join', room, nickname }));
-      signalingWs.onmessage = (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'joined') {
-          roomId = msg.room;
-          participantId = msg.participant_id;
-          sfuUrl = msg.sfu_url;
-          resolve();
-        } else if (msg.type === 'participant_left') {
-          removeVideoElement(msg.participant_id);
-        }
-      };
-      signalingWs.onerror = reject;
-    });
-  }
-
-  async function connectSFU() {
-    sfuWs = new WebSocket(sfuUrl);
-    await new Promise((resolve, reject) => { sfuWs.onopen = resolve; sfuWs.onerror = reject; });
-
-    sfuWs.send(JSON.stringify({ type: 'join', room: roomId, participant_id: participantId }));
-    await new Promise(resolve => {
-      sfuWs.onmessage = (e) => { if (JSON.parse(e.data).type === 'ready') resolve(); };
-    });
-
-    pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: ['turn:178.154.213.197:3478?transport=udp', 'turn:178.154.213.197:3478?transport=tcp'],
-          username: 'webrtc', credential: 'webrtc_password' }
-      ],
-      sdpSemantics: 'unified-plan'
-    });
-
-    pc.ontrack = (event) => {
-      const stream = event.streams[0];
-      if (!stream) return;
-      const remoteId = stream.id;  // SFU должен устанавливать stream.id = participant_id
-      if (!videoElements[remoteId]) {
-        addVideoElement(remoteId, stream);
-      }
-    };
-
-    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-    addVideoElement(participantId, localStream, true);
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    sfuWs.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp, type_sdp: pc.localDescription.type }));
-
-    sfuWs.onmessage = async (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'answer') {
-        if (pc.signalingState === 'have-local-offer') {
-          await pc.setRemoteDescription({ sdp: msg.sdp, type: msg.type_sdp });
-        }
-      } else if (msg.type === 'renegotiate') {
-        await handleRenegotiation(msg);
-      } else if (msg.type === 'pong') { /* heartbeat */ }
-    };
-
-    async function handleRenegotiation(msg) {
-      if (isRenegotiating) return;
-      isRenegotiating = true;
-      try {
-        // Ждём стабильного состояния с таймаутом
-        let waited = 0;
-        while (pc.signalingState !== 'stable' && waited < 5000) {
-          await new Promise(r => setTimeout(r, 50));
-          waited += 50;
-        }
-        if (pc.signalingState !== 'stable') {
-          console.warn('Not stable, aborting renegotiation');
-          return;
-        }
-        await pc.setRemoteDescription({ sdp: msg.sdp, type: msg.type_sdp });
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        sfuWs.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription.sdp, type_sdp: pc.localDescription.type }));
-      } catch (err) {
-        console.error('Renegotiation error:', err);
-      } finally {
-        isRenegotiating = false;
-      }
-    }
-
-    setInterval(() => {
-      if (sfuWs?.readyState === WebSocket.OPEN) sfuWs.send(JSON.stringify({ type: 'ping' }));
-    }, 15000);
-  }
-
-  async function leaveRoom() {
-    signalingWs?.close();
-    if (sfuWs) sfuWs.send(JSON.stringify({ type: 'leave' }));
-    pc?.close();
-    localStream?.getTracks().forEach(t => t.stop());
-    document.getElementById('join').disabled = false;
-    document.getElementById('leave').disabled = true;
-    videosContainer.innerHTML = '';
-    Object.keys(videoElements).forEach(k => delete videoElements[k]);
-  }
-
-  document.getElementById('join').onclick = async () => {
-    const room = document.getElementById('room').value.trim();
-    const nickname = document.getElementById('nickname').value.trim();
-    if (!room || !nickname) return alert('Room and nickname required');
-    document.getElementById('join').disabled = true;
-    document.getElementById('leave').disabled = false;
-    try {
-      await connectSignaling(room, nickname);
-      await connectSFU();
-    } catch (err) {
-      console.error(err);
-      alert('Connection failed');
-      leaveRoom();
-    }
-  };
-  document.getElementById('leave').onclick = leaveRoom;
-</script>
+    <script src="/static/js/client.js"></script>
 </body>
 </html>
