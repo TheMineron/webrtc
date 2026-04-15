@@ -83,3 +83,42 @@ video {
     margin-top: 8px;
     word-wrap: break-word;
 }
+
+#video-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    padding: 20px;
+}
+.local-video-container, .remote-video-container {
+    position: relative;
+    width: 400px;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+}
+video {
+    width: 100%;
+    height: auto;
+    background: #222;
+}
+.label {
+    position: absolute;
+    bottom: 8px;
+    left: 8px;
+    background: rgba(0,0,0,0.6);
+    color: white;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+#remoteVideos {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+}
+#stats, #metricsPanel {
+    margin: 20px;
+    padding: 10px;
+    border: 1px solid #ccc;
+}
