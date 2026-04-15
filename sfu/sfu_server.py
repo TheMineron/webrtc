@@ -32,13 +32,13 @@ class Room:
                 logger.info(f"Room {self.id} deleted (empty)")
 
     async def broadcast_track(self, sender_id: str, track):
-        """Переслать трек всем остальным участникам и инициировать ре-переговоры."""
+        """Переслать трек всем остальным участникам."""
         for pid, p in self.participants.items():
             if pid != sender_id:
                 logger.info(f"Relaying track {track.kind} from {sender_id} to {pid}")
                 relayed_track = relay.subscribe(track)
-                p.peer_connection.addTrack(relayed_track)
-                # Запускаем повторное согласование с этим клиентом
+                # Добавляем трек и инициируем ре-негоциацию
+                p.add_remote_track(relayed_track)
                 await p.renegotiate()
 
 
@@ -48,14 +48,15 @@ class Participant:
         self.room = room
         self.websocket = websocket
         self.peer_connection = RTCPeerConnection()
-        self._setup_peer_connection_handlers()
+        self._remote_tracks = []  # список добавленных удалённых треков для отслеживания
         self._renegotiation_lock = asyncio.Lock()
+        self._setup_peer_connection_handlers()
 
     def _setup_peer_connection_handlers(self):
         @self.peer_connection.on("track")
         async def on_track(track):
-            logger.info(f"Track received from {self.id}: {track.kind}")
-            # При получении нового трека от этого участника транслируем его остальным
+            logger.info(f"Local track received from {self.id}: {track.kind}")
+            # Трек от этого участника - транслируем остальным
             await self.room.broadcast_track(self.id, track)
 
         @self.peer_connection.on("connectionstatechange")
@@ -64,10 +65,16 @@ class Participant:
             if self.peer_connection.connectionState in ("failed", "closed"):
                 await self.close()
 
+    def add_remote_track(self, track):
+        """Добавить удалённый трек для отправки этому участнику."""
+        # Создаём трансивер с направлением sendonly для этого трека
+        transceiver = self.peer_connection.addTransceiver(track.kind, direction="sendonly")
+        transceiver.sender.replaceTrack(track)
+        self._remote_tracks.append(transceiver)
+
     async def renegotiate(self):
         """Инициировать повторное согласование с клиентом."""
         async with self._renegotiation_lock:
-            # Если соединение не в стабильном состоянии, повторная отправка не требуется
             if self.peer_connection.signalingState != "stable":
                 return
             try:
@@ -81,8 +88,19 @@ class Participant:
             except Exception as e:
                 logger.error(f"Renegotiation failed for {self.id}: {e}")
 
+    async def handle_offer(self, sdp: str):
+        """Обработать начальный offer от клиента."""
+        offer = RTCSessionDescription(sdp=sdp, type="offer")
+        await self.peer_connection.setRemoteDescription(offer)
+        answer = await self.peer_connection.createAnswer()
+        await self.peer_connection.setLocalDescription(answer)
+        await self.websocket.send(json.dumps({
+            "type": "answer",
+            "sdp": self.peer_connection.localDescription.sdp
+        }))
+
     async def handle_answer(self, sdp: str):
-        """Обработать answer от клиента."""
+        """Обработать answer от клиента (ответ на ре-негоциацию)."""
         answer = RTCSessionDescription(sdp=sdp, type="answer")
         await self.peer_connection.setRemoteDescription(answer)
 
@@ -95,7 +113,6 @@ rooms: Dict[str, Room] = {}
 
 
 def create_ice_candidate_from_js(cand_data: dict) -> RTCIceCandidate:
-    """Создать RTCIceCandidate из словаря, присланного браузером."""
     if hasattr(RTCIceCandidate, "from_js"):
         return RTCIceCandidate.from_js(cand_data)
     else:
@@ -145,18 +162,7 @@ async def handle_client(websocket):
                 if not participant:
                     await websocket.send(json.dumps({"type": "error", "message": "Not joined"}))
                     continue
-
-                offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
-                await participant.peer_connection.setRemoteDescription(offer)
-
-                # Отвечаем answer только если это начальный offer
-                if participant.peer_connection.signalingState == "have-remote-offer":
-                    answer = await participant.peer_connection.createAnswer()
-                    await participant.peer_connection.setLocalDescription(answer)
-                    await websocket.send(json.dumps({
-                        "type": "answer",
-                        "sdp": participant.peer_connection.localDescription.sdp
-                    }))
+                await participant.handle_offer(data["sdp"])
 
             elif msg_type == "answer":
                 if not participant:
