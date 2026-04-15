@@ -27,8 +27,8 @@ const pcConfig = {
 
         {
             urls: [
-                'turn:178.154.213.190:3478?transport=udp',
-                'turn:178.154.213.190:3478?transport=tcp'
+                'turn:178.154.213.197:3478?transport=udp',
+                'turn:178.154.213.197:3478?transport=tcp'
             ],
             username: 'webrtc',
             credential: 'webrtc_password'
