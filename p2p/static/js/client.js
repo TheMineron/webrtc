@@ -32,7 +32,7 @@ const pcConfig = {
 
 // --- Функции работы с WebSocket ---
 function connectWebSocket(roomId, nickname) {
-    const wsUrl = `ws://${window.location.host}/ws`;
+    const wsUrl = `wss://${window.location.host}/ws`;
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
