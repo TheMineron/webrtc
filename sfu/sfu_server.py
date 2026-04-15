@@ -112,9 +112,6 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
                 offer = RTCSessionDescription(sdp=data["sdp"], type="offer")
                 await pc.setRemoteDescription(offer)
 
-                # Добавляем существующие треки ДО создания answer
-                current_room.add_existing_tracks_to(pc)
-
                 answer = await pc.createAnswer()
                 await pc.setLocalDescription(answer)
                 await websocket.send(json.dumps({
