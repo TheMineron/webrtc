@@ -24,8 +24,17 @@ const pcConfig = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' }
-    ]
+
+        {
+            urls: [
+                'turn:178.154.213.190:3478?transport=udp',
+                'turn:178.154.213.190:3478?transport=tcp'
+            ],
+            username: 'webrtc',
+            credential: 'webrtc_password'
+        }
+    ],
+    iceCandidatePoolSize: 10
 };
 
 // --- Функции работы с WebSocket ---
