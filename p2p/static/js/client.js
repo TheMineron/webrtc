@@ -293,43 +293,42 @@ function sendMetricsToServer(metricData) {
 }
 
 async function handleSignal(fromId, fromName, data) {
+    console.log("Получен сигнал:", { fromId, fromName, data });
     let entry = peerConnections.get(fromId);
     let pc = entry ? entry.pc : null;
+
     if (!pc && data.type === "offer") {
         pc = createPeerConnection(fromId, fromName);
-        peerConnections.get(fromId);
+        entry = peerConnections.get(fromId);
     }
     if (!pc) return;
 
     try {
+        const sessionDesc = new RTCSessionDescription({
+            type: data.type,
+            sdp: data.sdp
+        });
+
         if (data.type === "offer") {
-            console.log("SDP string:", data.sdp);
-            console.log("SDP type:", data.type);
-            const sessionDesc = new RTCSessionDescription({
-                type: data.type,
-                sdp: data.sdp
-            });
             await pc.setRemoteDescription(sessionDesc);
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             ws.send(JSON.stringify({
                 type: "signal",
                 target_id: fromId,
-                data: {type: "answer", sdp: pc.localDescription.sdp}
+                data: { type: "answer", sdp: pc.localDescription.sdp }
             }));
             logStat(`Отправлен answer для ${fromName}`);
-        } else if (data.type === "answer") {
+        }
+        else if (data.type === "answer") {
             if (pc.signalingState === "have-local-offer") {
-                const sessionDesc = new RTCSessionDescription({
-                    type: data.type,
-                    sdp: data.sdp
-                });
                 await pc.setRemoteDescription(sessionDesc);
                 logStat(`Установлен remote description (answer) от ${fromName}`);
             } else {
-                console.warn(`Пропускаем answer, состояние ${pc.signalingState} (ожидается have-local-offer)`);
+                console.warn(`Answer пропущен, состояние: ${pc.signalingState}`);
             }
-        } else if (data.type === "ice") {
+        }
+        else if (data.type === "ice") {
             if (pc.remoteDescription) {
                 await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
                 logStat(`Добавлен ICE-кандидат от ${fromName}`);
@@ -341,7 +340,6 @@ async function handleSignal(fromId, fromName, data) {
         console.error("Ошибка обработки сигнала:", err);
     }
 }
-
 async function joinRoom(roomId, nickname) {
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
