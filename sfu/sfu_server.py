@@ -49,7 +49,7 @@ class BroadcastTrack(MediaStreamTrack):
 
     def subscribe(self) -> asyncio.Queue:
         """Подписывает нового получателя и возвращает его очередь."""
-        q = asyncio.Queue(maxsize=10)
+        q = asyncio.Queue(maxsize=100)
         self._subscribers.append(q)
         return q
 
