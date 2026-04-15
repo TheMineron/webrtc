@@ -299,47 +299,63 @@ async function handleSignal(fromId, fromName, data) {
 
     if (!pc && data.type === "offer") {
         pc = createPeerConnection(fromId, fromName);
-        entry = peerConnections.get(fromId);
     }
     if (!pc) return;
 
     try {
-        const sessionDesc = new RTCSessionDescription({
-            type: data.type,
-            sdp: data.sdp
-        });
+        if (data.type === "offer" || data.type === "answer") {
+            if (!data.sdp) {
+                console.error("Нет SDP в сообщении", data);
+                return;
+            }
 
-        if (data.type === "offer") {
-            await pc.setRemoteDescription(sessionDesc);
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            ws.send(JSON.stringify({
-                type: "signal",
-                target_id: fromId,
-                data: { type: "answer", sdp: pc.localDescription.sdp }
-            }));
-            logStat(`Отправлен answer для ${fromName}`);
-        }
-        else if (data.type === "answer") {
-            if (pc.signalingState === "have-local-offer") {
+            const sessionDesc = new RTCSessionDescription({
+                type: data.type,
+                sdp: data.sdp
+            });
+
+            if (data.type === "offer") {
                 await pc.setRemoteDescription(sessionDesc);
-                logStat(`Установлен remote description (answer) от ${fromName}`);
-            } else {
-                console.warn(`Answer пропущен, состояние: ${pc.signalingState}`);
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                ws.send(JSON.stringify({
+                    type: "signal",
+                    target_id: fromId,
+                    data: { type: "answer", sdp: pc.localDescription.sdp }
+                }));
+                logStat(`Отправлен answer для ${fromName}`);
+            }
+            else if (data.type === "answer") {
+                // Проверяем состояние: answer можно установить только в состоянии "have-local-offer"
+                if (pc.signalingState === "have-local-offer") {
+                    await pc.setRemoteDescription(sessionDesc);
+                    logStat(`Установлен remote description (answer) от ${fromName}`);
+                } else {
+                    console.warn(`Answer пропущен, состояние: ${pc.signalingState}`);
+                }
             }
         }
+        // Обработка ICE-кандидатов
         else if (data.type === "ice") {
             if (pc.remoteDescription) {
-                await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-                logStat(`Добавлен ICE-кандидат от ${fromName}`);
+                if (data.candidate) {
+                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                    logStat(`Добавлен ICE-кандидат от ${fromName}`);
+                } else {
+                    logStat(`Получен пустой ICE-кандидат от ${fromName}, игнорируем`);
+                }
             } else {
                 logStat(`ICE кандидат получен до установки remote description, игнорируем`);
             }
+        }
+        else {
+            console.warn("Неизвестный тип сигнала:", data.type);
         }
     } catch (err) {
         console.error("Ошибка обработки сигнала:", err);
     }
 }
+
 async function joinRoom(roomId, nickname) {
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
