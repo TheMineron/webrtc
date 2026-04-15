@@ -28,7 +28,7 @@ class RoomInfo:
 
 rooms: Dict[str, RoomInfo] = {}
 
-SFU_WS_URL = "ws://localhost:8001/ws"
+SFU_WS_URL = "wss://localhost:8001/ws"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
