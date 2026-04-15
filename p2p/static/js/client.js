@@ -4,6 +4,7 @@ let ws = null;
 let currentRoom = null;
 let myId = null;
 let myName = null;
+let polite = false;
 
 let incomingOffers = new Set();
 
@@ -43,17 +44,17 @@ async function initLocalStream() {
 }
 
 function createPeerConnection(targetId, targetName) {
-    const pc = new RTCPeerConnection(iceServers);
     const dataChannel = pc.createDataChannel("metrics");
-    let callStartTime = performance.now();
+    const pc = new RTCPeerConnection(iceServers);
+    const callStartTime = performance.now();
 
-    peerConnections.set(targetId, {
-        pc,
-        targetName,
-        callStartTime,
-        dataChannel,
-        processedSignals: new Set()
-    });
+    const entry = {
+        pc, targetName, callStartTime,
+        dataChannel: null,
+        processedSignals: new Set(),
+        pendingCandidates: []
+    };
+    peerConnections.set(targetId, entry);
 
     if (localStream) {
         localStream.getTracks().forEach(track => {
@@ -109,10 +110,40 @@ function createPeerConnection(targetId, targetName) {
         logStat(`Соединение с ${targetName}: ${pc.connectionState}`);
     };
 
+    pc.onnegotiationneeded = async () => {
+        logStat(`onnegotiationneeded для ${targetName}`);
+        try {
+            if (polite && pc.signalingState !== "stable") {
+                logStat(`Вежливый пир, но состояние не stable, пропускаем.`);
+                return;
+            }
+            await pc.setLocalDescription(await pc.createOffer());
+            ws.send(JSON.stringify({
+                type: "signal",
+                target_id: targetId,
+                data: {type: "offer", sdp: pc.localDescription.sdp}
+            }));
+            logStat(`Отправлен offer для ${targetName}`);
+        } catch (err) {
+            console.error("Ошибка в onnegotiationneeded:", err);
+        }
+    };
+
     if (dataChannel) {
         dataChannel.onopen = () => logStat(`DataChannel с ${targetName} открыт (инициатор)`);
         dataChannel.onmessage = handleDataChannelMessage;
     }
+
+    const originalSetRemoteDesc = pc.setRemoteDescription;
+    pc.setRemoteDescription = function (desc) {
+        return originalSetRemoteDesc.call(pc, desc).then(() => {
+            if (entry.pendingCandidates && entry.pendingCandidates.length) {
+                logStat(`Добавляем ${entry.pendingCandidates.length} отложенных ICE для ${targetName}`);
+                entry.pendingCandidates.forEach(c => pc.addIceCandidate(new RTCIceCandidate(c)));
+                entry.pendingCandidates = [];
+            }
+        });
+    };
 
     return pc;
 }
@@ -306,94 +337,56 @@ function sendMetricsToServer(metricData) {
 
 async function handleSignal(fromId, fromName, data) {
     console.log("Получен сигнал:", {fromId, fromName, data});
-
     let entry = peerConnections.get(fromId);
     let pc = entry ? entry.pc : null;
 
-    let signalKey = null;
-    if (data.type === "offer" || data.type === "answer") {
-        signalKey = `${data.type}_${data.sdp}`;
-        if (entry && entry.processedSignals.has(signalKey)) {
-            logStat(`Игнорируем повторный ${data.type} от ${fromName}`);
-            return;
-        }
-    }
-
-    if (!pc && data.type === "offer") {
+    if (!pc) {
         pc = createPeerConnection(fromId, fromName);
         entry = peerConnections.get(fromId);
-        if (entry && signalKey) entry.processedSignals.add(signalKey);
     }
 
-    if (!pc) return;
+    if (data.type === "offer") {
+        polite = (myId > fromId);
 
-    try {
-        if (data.type === "offer") {
-            if (!data.sdp) {
-                console.error("Нет SDP в offer", data);
-                return;
-            }
-
-            const sessionDesc = new RTCSessionDescription({
-                type: "offer",
-                sdp: data.sdp
-            });
-
-            if (pc.remoteDescription && pc.signalingState !== "stable") {
-                logStat(`Игнорируем offer в состоянии ${pc.signalingState}`);
-                return;
-            }
-
-            await pc.setRemoteDescription(sessionDesc);
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            ws.send(JSON.stringify({
-                type: "signal",
-                target_id: fromId,
-                data: {type: "answer", sdp: pc.localDescription.sdp}
-            }));
-            logStat(`Отправлен answer для ${fromName}`);
-        } else if (data.type === "answer") {
-            if (!data.sdp) {
-                console.error("Нет SDP в answer", data);
-                return;
-            }
-
-            if (pc.signalingState !== "have-local-offer") {
-                logStat(`Answer пропущен, состояние: ${pc.signalingState}, ожидалось have-local-offer`);
-                return;
-            }
-
-            const sessionDesc = new RTCSessionDescription({
-                type: "answer",
-                sdp: data.sdp
-            });
-            await pc.setRemoteDescription(sessionDesc);
-            logStat(`Установлен remote description (answer) от ${fromName}`);
-
-            if (entry && signalKey) entry.processedSignals.add(signalKey);
-        } else if (data.type === "ice") {
-            if (pc.remoteDescription) {
-                if (data.candidate) {
-                    try {
-                        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-                        logStat(`Добавлен ICE-кандидат от ${fromName}`);
-                    } catch (iceErr) {
-                        console.warn("Ошибка добавления ICE-кандидата:", iceErr);
-                    }
-                } else {
-                    logStat(`Пустой ICE-кандидат от ${fromName}, игнорируем`);
-                }
-            } else {
-                logStat(`ICE кандидат получен до установки remote description, игнорируем`);
-            }
-        } else {
-            console.warn("Неизвестный тип сигнала:", data.type);
+        if (pc.signalingState !== "stable") {
+            logStat(`Соединение с ${fromName} не в stable состоянии, игнорируем offer.`);
+            return;
         }
-    } catch (err) {
-        console.error("Ошибка обработки сигнала:", err);
-        if (err.name === "InvalidStateError" && pc.signalingState === "stable") {
-            logStat("Попытка восстановления: перезапуск ICE");
+        await pc.setRemoteDescription(new RTCSessionDescription(data));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({
+            type: "signal",
+            target_id: fromId,
+            data: {type: "answer", sdp: pc.localDescription.sdp}
+        }));
+        logStat(`Отправлен answer для ${fromName}`);
+    } else if (data.type === "answer") {
+
+        if (pc.signalingState === "have-local-offer") {
+            await pc.setRemoteDescription(new RTCSessionDescription(data));
+        } else if (polite && pc.signalingState === "have-remote-offer") {
+            logStat(`Коллизия! Откатываем localDescription для ${fromName}`);
+            await pc.setLocalDescription({type: "rollback"});
+            await pc.setRemoteDescription(new RTCSessionDescription(data));
+        } else {
+            logStat(`Answer получен в неожиданном состоянии: ${pc.signalingState}`);
+        }
+    } else if (data.type === "ice") {
+        if (data.candidate) {
+            try {
+                if (pc.remoteDescription) {
+                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                    logStat(`Добавлен ICE-кандидат от ${fromName}`);
+                } else {
+                    logStat(`ICE кандидат отложен, ждем remoteDescription для ${fromName}`);
+                    // Сохраняем кандидата, чтобы добавить позже
+                    if (!entry.pendingCandidates) entry.pendingCandidates = [];
+                    entry.pendingCandidates.push(data.candidate);
+                }
+            } catch (err) {
+                console.warn("Ошибка добавления ICE-кандидата:", err);
+            }
         }
     }
 }
