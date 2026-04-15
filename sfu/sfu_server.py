@@ -32,20 +32,14 @@ class Room:
                 logger.info(f"Room {self.id} deleted (empty)")
 
     async def broadcast_track(self, sender_id: str, track):
-        """Переслать трек от одного участника всем остальным в комнате."""
+        """Переслать трек всем остальным участникам и инициировать ре-переговоры."""
         for pid, p in self.participants.items():
             if pid != sender_id:
-                logger.debug(f"Relaying track from {sender_id} to {pid}")
+                logger.info(f"Relaying track {track.kind} from {sender_id} to {pid}")
                 relayed_track = relay.subscribe(track)
                 p.peer_connection.addTrack(relayed_track)
-                await self._renegotiate(p.peer_connection)
-
-    async def _renegotiate(self, pc: RTCPeerConnection):
-        try:
-            offer = await pc.createOffer()
-            await pc.setLocalDescription(offer)
-        except Exception as e:
-            logger.error(f"Renegotiation error: {e}")
+                # Запускаем повторное согласование с этим клиентом
+                await p.renegotiate()
 
 
 class Participant:
@@ -55,11 +49,13 @@ class Participant:
         self.websocket = websocket
         self.peer_connection = RTCPeerConnection()
         self._setup_peer_connection_handlers()
+        self._renegotiation_lock = asyncio.Lock()
 
     def _setup_peer_connection_handlers(self):
         @self.peer_connection.on("track")
         async def on_track(track):
             logger.info(f"Track received from {self.id}: {track.kind}")
+            # При получении нового трека от этого участника транслируем его остальным
             await self.room.broadcast_track(self.id, track)
 
         @self.peer_connection.on("connectionstatechange")
@@ -67,6 +63,28 @@ class Participant:
             logger.info(f"Connection state for {self.id}: {self.peer_connection.connectionState}")
             if self.peer_connection.connectionState in ("failed", "closed"):
                 await self.close()
+
+    async def renegotiate(self):
+        """Инициировать повторное согласование с клиентом."""
+        async with self._renegotiation_lock:
+            # Если соединение не в стабильном состоянии, повторная отправка не требуется
+            if self.peer_connection.signalingState != "stable":
+                return
+            try:
+                offer = await self.peer_connection.createOffer()
+                await self.peer_connection.setLocalDescription(offer)
+                await self.websocket.send(json.dumps({
+                    "type": "offer",
+                    "sdp": self.peer_connection.localDescription.sdp
+                }))
+                logger.debug(f"Sent renegotiation offer to {self.id}")
+            except Exception as e:
+                logger.error(f"Renegotiation failed for {self.id}: {e}")
+
+    async def handle_answer(self, sdp: str):
+        """Обработать answer от клиента."""
+        answer = RTCSessionDescription(sdp=sdp, type="answer")
+        await self.peer_connection.setRemoteDescription(answer)
 
     async def close(self):
         self.room.remove_participant(self.id)
@@ -77,14 +95,12 @@ rooms: Dict[str, Room] = {}
 
 
 def create_ice_candidate_from_js(cand_data: dict) -> RTCIceCandidate:
-    """Создаёт объект RTCIceCandidate из словаря, присланного браузером."""
-    # В зависимости от версии aiortc либо используем from_js, либо конструируем вручную
+    """Создать RTCIceCandidate из словаря, присланного браузером."""
     if hasattr(RTCIceCandidate, "from_js"):
         return RTCIceCandidate.from_js(cand_data)
     else:
-        # Ручное создание для старых версий aiortc
         return RTCIceCandidate(
-            component=cand_data.get("component", 1),  # обычно RTP
+            component=cand_data.get("component", 1),
             foundation=cand_data.get("foundation", ""),
             ip=cand_data.get("ip", ""),
             port=cand_data.get("port", 0),
@@ -133,13 +149,20 @@ async def handle_client(websocket):
                 offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
                 await participant.peer_connection.setRemoteDescription(offer)
 
-                answer = await participant.peer_connection.createAnswer()
-                await participant.peer_connection.setLocalDescription(answer)
+                # Отвечаем answer только если это начальный offer
+                if participant.peer_connection.signalingState == "have-remote-offer":
+                    answer = await participant.peer_connection.createAnswer()
+                    await participant.peer_connection.setLocalDescription(answer)
+                    await websocket.send(json.dumps({
+                        "type": "answer",
+                        "sdp": participant.peer_connection.localDescription.sdp
+                    }))
 
-                await websocket.send(json.dumps({
-                    "type": "answer",
-                    "sdp": participant.peer_connection.localDescription.sdp
-                }))
+            elif msg_type == "answer":
+                if not participant:
+                    await websocket.send(json.dumps({"type": "error", "message": "Not joined"}))
+                    continue
+                await participant.handle_answer(data["sdp"])
 
             elif msg_type == "ice-candidate":
                 if not participant:
