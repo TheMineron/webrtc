@@ -2,8 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Dict, Set, Optional, List
-from fractions import Fraction
+from typing import Dict, Optional, List
 
 import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
@@ -205,8 +204,17 @@ async def sfu_websocket_handler(websocket: WebSocketServerProtocol):
             logger.info(f"Room {current_room.room_id} deleted (empty)")
 
 async def main():
-    async with websockets.serve(sfu_websocket_handler, "0.0.0.0", 8001):
-        logger.info("SFU server running on ws://0.0.0.0:8001")
+    # Создаём SSL-контекст
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain('cert.pem', 'key.pem')   # убедитесь, что пути правильные
+
+    async with websockets.serve(
+        sfu_websocket_handler,
+        "0.0.0.0",
+        8001,
+        ssl=ssl_context
+    ):
+        logger.info("SFU server running on wss://0.0.0.0:8001")
         await asyncio.Future()
 
 if __name__ == "__main__":
