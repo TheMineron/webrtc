@@ -1,4 +1,4 @@
-// client.js
+// client.js (исправленная версия)
 
 // --- DOM элементы ---
 const joinScreen = document.getElementById('join-screen');
@@ -32,7 +32,7 @@ const pcConfig = {
 
 // --- Функции работы с WebSocket ---
 function connectWebSocket(roomId, nickname) {
-    const wsUrl = `wss://${window.location.host}/ws`;
+    const wsUrl = `ws://${window.location.host}/ws`;
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
@@ -101,16 +101,12 @@ async function handleSignalingMessage(msg) {
             break;
 
         case 'existing_participants':
-            console.log('Существующие участники (мы новичок):', msg.participants);
-            // Новичок НЕ инициирует offer, только создаёт PeerConnection и ждёт offer от каждого существующего
-            for (const p of msg.participants) {
-                await createPeerConnection(p.id, false); // isInitiator = false
-            }
+            console.log('Существующие участники (ждём offer от них):', msg.participants);
+            // НИЧЕГО НЕ СОЗДАЁМ — будем создавать peer при получении offer
             break;
 
         case 'participant_joined':
-            console.log('Новый участник (мы уже в комнате):', msg.participant);
-            // Существующий участник инициирует offer для новичка
+            console.log('Новый участник, создаём активное соединение:', msg.participant);
             await createPeerConnection(msg.participant.id, true);
             break;
 
@@ -164,7 +160,7 @@ async function createPeerConnection(remoteId, isInitiator) {
         pc: pc,
         videoElement: videoElement,
         stream: null,
-        pendingCandidates: [] // буфер ICE-кандидатов до установки remote description
+        pendingCandidates: []
     };
     peers.set(remoteId, peerInfo);
 
@@ -199,7 +195,6 @@ async function createPeerConnection(remoteId, isInitiator) {
         }
     };
 
-    // Если мы инициатор – создаём offer
     if (isInitiator) {
         try {
             const offer = await pc.createOffer();
@@ -217,27 +212,31 @@ async function createPeerConnection(remoteId, isInitiator) {
 // --- Обработка сигналов от удалённого участника ---
 async function handleSignal(fromId, signalData) {
     let peerInfo = peers.get(fromId);
-    if (!peerInfo && (signalData.type === 'offer' || signalData.type === 'answer')) {
-        // Если пришёл offer или answer, а пира нет – создаём пассивное соединение (как ответчик)
+
+    // Если пришёл offer и пира нет — создаём пассивное соединение (только для offer)
+    if (!peerInfo && signalData.type === 'offer') {
         await createPeerConnection(fromId, false);
         peerInfo = peers.get(fromId);
     }
+
     if (!peerInfo) {
         console.warn(`Нет peer для ${fromId}, игнорируем ${signalData.type}`);
         return;
     }
+
     const pc = peerInfo.pc;
 
     try {
         switch (signalData.type) {
             case 'offer':
+                if (pc.signalingState !== 'stable') {
+                    console.warn(`Неподходящее состояние для offer: ${pc.signalingState}`);
+                    return;
+                }
                 await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: signalData.sdp }));
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                sendSignal(fromId, {
-                    type: 'answer',
-                    sdp: answer.sdp
-                });
+                sendSignal(fromId, { type: 'answer', sdp: answer.sdp });
                 // Отправляем накопившиеся ICE-кандидаты
                 if (peerInfo.pendingCandidates.length) {
                     for (const cand of peerInfo.pendingCandidates) {
@@ -248,8 +247,11 @@ async function handleSignal(fromId, signalData) {
                 break;
 
             case 'answer':
+                if (pc.signalingState !== 'have-local-offer') {
+                    console.warn(`Неподходящее состояние для answer: ${pc.signalingState}`);
+                    return;
+                }
                 await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: signalData.sdp }));
-                // Отправляем накопившиеся ICE-кандидаты
                 if (peerInfo.pendingCandidates.length) {
                     for (const cand of peerInfo.pendingCandidates) {
                         await pc.addIceCandidate(cand);
@@ -261,7 +263,6 @@ async function handleSignal(fromId, signalData) {
             case 'ice-candidate':
                 if (signalData.candidate) {
                     const candidate = new RTCIceCandidate(signalData.candidate);
-                    // Если remote description ещё не установлен – буферизируем
                     if (pc.remoteDescription) {
                         await pc.addIceCandidate(candidate);
                     } else {
@@ -308,12 +309,12 @@ async function initLocalMedia() {
         localVideo.srcObject = localStream;
         console.log('Локальный поток получен');
 
-        // Добавляем треки во все уже созданные пиры
+        // Добавляем треки во все уже созданные пиры (если они были созданы до получения медиа)
         for (const [remoteId, peerInfo] of peers.entries()) {
             localStream.getTracks().forEach(track => {
                 peerInfo.pc.addTrack(track, localStream);
             });
-            // Если соединение уже в stable и есть remote description, нужно переслать offer (renegotiation)
+            // Если соединение уже в stable и есть remoteDescription, нужно переслать offer (renegotiation)
             if (peerInfo.pc.signalingState === 'stable' && peerInfo.pc.remoteDescription) {
                 const offer = await peerInfo.pc.createOffer();
                 await peerInfo.pc.setLocalDescription(offer);
