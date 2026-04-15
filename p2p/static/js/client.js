@@ -9,17 +9,15 @@ const startLatencyTestBtn = document.getElementById('startLatencyTest');
 const latencyResultDiv = document.getElementById('latencyResult');
 const webrtcStatsDiv = document.getElementById('webrtcStats');
 
-// --- Глобальные переменные ---
 let ws = null;
 let localStream = null;
 let currentRoomId = null;
 let currentNickname = null;
 let currentParticipantId = null;
 
-// Хранилище пиров: key = remoteParticipantId, value = { pc, videoElement, stream, pendingCandidates }
 const peers = new Map();
+const prevStatsMap = new Map();
 
-// --- Конфигурация STUN/TURN серверов ---
 const pcConfig = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -37,7 +35,7 @@ const pcConfig = {
     iceCandidatePoolSize: 10
 };
 
-// --- Функции работы с WebSocket ---
+
 function connectWebSocket(roomId, nickname) {
     const wsUrl = `wss://${window.location.host}/ws`;
     ws = new WebSocket(wsUrl);
@@ -93,7 +91,6 @@ function sendPing() {
     return timestamp;
 }
 
-// --- Обработка входящих сигнальных сообщений ---
 async function handleSignalingMessage(msg) {
     switch (msg.type) {
         case 'joined':
@@ -141,7 +138,6 @@ async function handleSignalingMessage(msg) {
     }
 }
 
-// --- WebRTC: создание PeerConnection ---
 async function createPeerConnection(remoteId, isInitiator) {
     if (peers.has(remoteId)) {
         console.warn(`[PC] Peer ${remoteId} уже существует, пропускаем`);
@@ -172,7 +168,6 @@ async function createPeerConnection(remoteId, isInitiator) {
     };
     peers.set(remoteId, peerInfo);
 
-    // Добавляем локальные треки, если уже есть
     if (localStream) {
         console.log(`[PC] Добавляем локальные треки для ${remoteId}`);
         localStream.getTracks().forEach(track => {
@@ -241,12 +236,10 @@ async function createPeerConnection(remoteId, isInitiator) {
     }
 }
 
-// --- Обработка сигналов от удалённого участника ---
 async function handleSignal(fromId, signalData) {
     console.log(`[SIGNAL] Обработка сигнала от ${fromId}, тип: ${signalData.type}`);
     let peerInfo = peers.get(fromId);
 
-    // Если пришёл offer и пира нет — создаём пассивное соединение
     if (!peerInfo && signalData.type === 'offer') {
         console.log(`[SIGNAL] Получен offer от ${fromId}, создаём пассивный peer`);
         await createPeerConnection(fromId, false);
@@ -276,7 +269,7 @@ async function handleSignal(fromId, signalData) {
                 await pc.setLocalDescription(answer);
                 console.log(`[SIGNAL] LocalDescription установлен, отправляем answer`);
                 sendSignal(fromId, { type: 'answer', sdp: answer.sdp });
-                // Отправляем накопившиеся ICE-кандидаты
+
                 if (peerInfo.pendingCandidates.length) {
                     console.log(`[SIGNAL] Добавляем ${peerInfo.pendingCandidates.length} накопленных ICE-кандидатов`);
                     for (const cand of peerInfo.pendingCandidates) {
@@ -335,6 +328,7 @@ function removePeer(remoteId) {
         const container = document.getElementById(`remote-${remoteId}`);
         if (container) container.remove();
         peers.delete(remoteId);
+        prevStatsMap.delete(remoteId);
         console.log(`[REMOVE] Peer ${remoteId} удалён`);
     }
 }
@@ -349,7 +343,7 @@ function cleanupAllPeers() {
     remoteVideosDiv.innerHTML = '';
 }
 
-// --- Локальная медиа ---
+
 async function initLocalMedia() {
     try {
         console.log('[MEDIA] Запрашиваем доступ к камере/микрофону');
@@ -357,13 +351,11 @@ async function initLocalMedia() {
         localVideo.srcObject = localStream;
         console.log('[MEDIA] Локальный поток получен, треки:', localStream.getTracks().map(t => t.kind));
 
-        // Добавляем треки во все уже созданные пиры
         for (const [remoteId, peerInfo] of peers.entries()) {
             console.log(`[MEDIA] Добавляем локальные треки к существующему peer ${remoteId}`);
             localStream.getTracks().forEach(track => {
                 peerInfo.pc.addTrack(track, localStream);
             });
-            // Если соединение уже в stable и есть remoteDescription, нужно переслать offer (renegotiation)
             if (peerInfo.pc.signalingState === 'stable' && peerInfo.pc.remoteDescription) {
                 console.log(`[MEDIA] Пересылаем offer для renegotiation с ${remoteId}`);
                 const offer = await peerInfo.pc.createOffer();
@@ -377,7 +369,6 @@ async function initLocalMedia() {
     }
 }
 
-// --- Измерение задержки ---
 startLatencyTestBtn.addEventListener('click', () => {
     if (ws && ws.readyState === WebSocket.OPEN) {
         sendPing();
@@ -387,30 +378,52 @@ startLatencyTestBtn.addEventListener('click', () => {
     }
 });
 
-// --- Получение статистики WebRTC (getStats) ---
 async function collectStats() {
     let statsText = '';
+    const now = Date.now();
+
     for (const [remoteId, peerInfo] of peers.entries()) {
         const pc = peerInfo.pc;
         if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') continue;
+
         const stats = await pc.getStats();
         let inboundRtpStats = null;
         let candidatePairStats = null;
+
         stats.forEach(report => {
             if (report.type === 'inbound-rtp' && report.kind === 'video') inboundRtpStats = report;
             if (report.type === 'candidate-pair' && report.nominated === true) candidatePairStats = report;
         });
+
         if (inboundRtpStats) {
+            const currentBytes = inboundRtpStats.bytesReceived;
+            const prev = prevStatsMap.get(remoteId);
+            let bitrateKbps = 0;
+
+            if (prev && prev.bytes !== undefined && prev.timestamp) {
+                const bytesDiff = currentBytes - prev.bytes;
+                const timeDiffSec = (now - prev.timestamp) / 1000;
+                if (timeDiffSec > 0 && bytesDiff >= 0) {
+                    bitrateKbps = (bytesDiff * 8) / timeDiffSec / 1000;
+                }
+            }
+
+            prevStatsMap.set(remoteId, { bytes: currentBytes, timestamp: now });
+
             statsText += `Участник ${remoteId.slice(0,6)}:\n`;
-            statsText += `  Битрейт видео: ${(inboundRtpStats.bytesReceived / 1024).toFixed(2)} KB\n`;
+            statsText += `  Битрейт видео: ${bitrateKbps.toFixed(2)} kbps\n`;
             statsText += `  Потеря пакетов: ${inboundRtpStats.packetsLost}\n`;
             statsText += `  Джиттер: ${inboundRtpStats.jitter?.toFixed(3)} с\n`;
+        } else {
+            statsText += `Участник ${remoteId.slice(0,6)}: нет видео-потока\n`;
         }
+
         if (candidatePairStats) {
             statsText += `  RTT (ICE): ${(candidatePairStats.currentRoundTripTime * 1000).toFixed(2)} мс\n`;
         }
         statsText += '\n';
     }
+
     if (statsText === '') statsText = 'Нет активных соединений';
     webrtcStatsDiv.innerHTML = `<pre>${statsText}</pre>`;
 }
@@ -419,7 +432,7 @@ setInterval(() => {
     if (videoGrid.style.display !== 'none') collectStats();
 }, 5000);
 
-// --- Запуск ---
+
 joinBtn.addEventListener('click', () => {
     const nickname = nicknameInput.value.trim();
     const roomId = roomIdInput.value.trim();
