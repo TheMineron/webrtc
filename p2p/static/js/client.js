@@ -1,3 +1,6 @@
+// client.js
+
+// --- DOM элементы ---
 const joinScreen = document.getElementById('join-screen');
 const videoGrid = document.getElementById('video-grid');
 const nicknameInput = document.getElementById('nickname');
@@ -16,10 +19,10 @@ let currentRoomId = null;
 let currentNickname = null;
 let currentParticipantId = null;
 
-// Хранилище пиров: key = remoteParticipantId, value = { pc, videoElement, stream }
+// Хранилище пиров: key = remoteParticipantId, value = { pc, videoElement, stream, pendingCandidates }
 const peers = new Map();
 
-// --- Конфигурация STUN/TURN серверов (можно заменить на свои) ---
+// --- Конфигурация STUN/TURN серверов ---
 const pcConfig = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -28,13 +31,12 @@ const pcConfig = {
 };
 
 // --- Функции работы с WebSocket ---
-function connectWebSocket(roomId, nickname, participantId) {
-    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
+function connectWebSocket(roomId, nickname) {
+    const wsUrl = `ws://${window.location.host}/ws`;
+    ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
         console.log('WebSocket соединение установлено');
-        // Отправляем команду join
         sendJoin(roomId, nickname);
     };
 
@@ -53,7 +55,6 @@ function connectWebSocket(roomId, nickname, participantId) {
 
     ws.onclose = () => {
         console.log('WebSocket закрыт');
-        // При отключении очищаем все соединения
         cleanupAllPeers();
         if (localStream) {
             localStream.getTracks().forEach(track => track.stop());
@@ -65,30 +66,24 @@ function connectWebSocket(roomId, nickname, participantId) {
 }
 
 function sendJoin(roomId, nickname) {
-    const msg = {
+    ws.send(JSON.stringify({
         type: 'join',
         room: roomId,
         nickname: nickname
-    };
-    ws.send(JSON.stringify(msg));
+    }));
 }
 
 function sendSignal(targetId, data) {
-    const msg = {
+    ws.send(JSON.stringify({
         type: 'signal',
         target_id: targetId,
         data: data
-    };
-    ws.send(JSON.stringify(msg));
+    }));
 }
 
 function sendPing() {
     const timestamp = Date.now();
-    const msg = {
-        type: 'ping',
-        timestamp: timestamp
-    };
-    ws.send(JSON.stringify(msg));
+    ws.send(JSON.stringify({ type: 'ping', timestamp: timestamp }));
     return timestamp;
 }
 
@@ -99,23 +94,23 @@ async function handleSignalingMessage(msg) {
             currentRoomId = msg.room;
             currentNickname = msg.nickname;
             currentParticipantId = msg.participant_id;
-            console.log(`Успешно присоединились: комната ${currentRoomId}, id=${currentParticipantId}`);
-            // Показываем видео сетку
+            console.log(`Присоединились: комната ${currentRoomId}, id=${currentParticipantId}`);
             joinScreen.style.display = 'none';
             videoGrid.style.display = 'flex';
-            // Запрашиваем доступ к камере и микрофону
             await initLocalMedia();
             break;
 
         case 'existing_participants':
-            console.log('Существующие участники:', msg.participants);
+            console.log('Существующие участники (мы новичок):', msg.participants);
+            // Новичок НЕ инициирует offer, только создаёт PeerConnection и ждёт offer от каждого существующего
             for (const p of msg.participants) {
-                await createPeerConnection(p.id, true); // true означает, что мы инициируем соединение (offer)
+                await createPeerConnection(p.id, false); // isInitiator = false
             }
             break;
 
         case 'participant_joined':
-            console.log('Новый участник:', msg.participant);
+            console.log('Новый участник (мы уже в комнате):', msg.participant);
+            // Существующий участник инициирует offer для новичка
             await createPeerConnection(msg.participant.id, true);
             break;
 
@@ -125,15 +120,12 @@ async function handleSignalingMessage(msg) {
             break;
 
         case 'signal':
-            // Сигнал от другого участника
-            const fromId = msg.from_id;
-            const signalData = msg.data;
-            await handleSignal(fromId, signalData);
+            await handleSignal(msg.from_id, msg.data);
             break;
 
         case 'pong':
             const rtt = Date.now() - msg.timestamp;
-            latencyResultDiv.innerHTML = `<p>⏱️ Задержка RTT (через WebSocket): ${rtt} мс</p>`;
+            latencyResultDiv.innerHTML = `<p>⏱️ RTT через WebSocket: ${rtt} мс</p>`;
             break;
 
         case 'error':
@@ -142,14 +134,14 @@ async function handleSignalingMessage(msg) {
             break;
 
         default:
-            console.warn('Неизвестный тип сообщения:', msg.type);
+            console.warn('Неизвестный тип:', msg.type);
     }
 }
 
 // --- WebRTC: создание PeerConnection ---
-async function createPeerConnection(remoteParticipantId, isInitiator) {
-    if (peers.has(remoteParticipantId)) {
-        console.warn(`Peer ${remoteParticipantId} уже существует`);
+async function createPeerConnection(remoteId, isInitiator) {
+    if (peers.has(remoteId)) {
+        console.warn(`Peer ${remoteId} уже существует`);
         return;
     }
 
@@ -160,42 +152,40 @@ async function createPeerConnection(remoteParticipantId, isInitiator) {
     videoElement.classList.add('remote-video');
     const container = document.createElement('div');
     container.className = 'remote-video-container';
-    container.id = `remote-${remoteParticipantId}`;
+    container.id = `remote-${remoteId}`;
     container.appendChild(videoElement);
     const label = document.createElement('div');
     label.className = 'label';
-    label.textContent = `Участник ${remoteParticipantId.slice(0, 6)}`;
+    label.textContent = `Участник ${remoteId.slice(0, 6)}`;
     container.appendChild(label);
     remoteVideosDiv.appendChild(container);
 
-    // Сохраняем видеоэлемент для последующего использования
     const peerInfo = {
         pc: pc,
         videoElement: videoElement,
-        stream: null
+        stream: null,
+        pendingCandidates: [] // буфер ICE-кандидатов до установки remote description
     };
-    peers.set(remoteParticipantId, peerInfo);
+    peers.set(remoteId, peerInfo);
 
-    // Добавляем локальный трек, если он уже есть
+    // Добавляем локальные треки, если уже есть
     if (localStream) {
         localStream.getTracks().forEach(track => {
             pc.addTrack(track, localStream);
         });
     }
 
-    // Обработка ICE-кандидатов
     pc.onicecandidate = (event) => {
         if (event.candidate) {
-            sendSignal(remoteParticipantId, {
+            sendSignal(remoteId, {
                 type: 'ice-candidate',
                 candidate: event.candidate
             });
         }
     };
 
-    // Получение удалённого потока
     pc.ontrack = (event) => {
-        console.log(`Получен трек от ${remoteParticipantId}`);
+        console.log(`Получен трек от ${remoteId}`);
         if (peerInfo.videoElement.srcObject !== event.streams[0]) {
             peerInfo.videoElement.srcObject = event.streams[0];
             peerInfo.stream = event.streams[0];
@@ -203,32 +193,37 @@ async function createPeerConnection(remoteParticipantId, isInitiator) {
     };
 
     pc.oniceconnectionstatechange = () => {
-        console.log(`ICE состояние для ${remoteParticipantId}: ${pc.iceConnectionState}`);
+        console.log(`ICE состояние для ${remoteId}: ${pc.iceConnectionState}`);
         if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
-            removePeer(remoteParticipantId);
+            removePeer(remoteId);
         }
     };
 
+    // Если мы инициатор – создаём offer
     if (isInitiator) {
-        // Создаём offer
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        sendSignal(remoteParticipantId, {
-            type: 'offer',
-            sdp: offer.sdp
-        });
+        try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            sendSignal(remoteId, {
+                type: 'offer',
+                sdp: offer.sdp
+            });
+        } catch (err) {
+            console.error(`Ошибка создания offer для ${remoteId}:`, err);
+        }
     }
 }
 
+// --- Обработка сигналов от удалённого участника ---
 async function handleSignal(fromId, signalData) {
     let peerInfo = peers.get(fromId);
     if (!peerInfo && (signalData.type === 'offer' || signalData.type === 'answer')) {
-        // Если пришёл offer или answer, а пира нет - создаём пассивное соединение
+        // Если пришёл offer или answer, а пира нет – создаём пассивное соединение (как ответчик)
         await createPeerConnection(fromId, false);
         peerInfo = peers.get(fromId);
     }
     if (!peerInfo) {
-        console.warn(`Нет peer для ${fromId}, игнорируем сигнал ${signalData.type}`);
+        console.warn(`Нет peer для ${fromId}, игнорируем ${signalData.type}`);
         return;
     }
     const pc = peerInfo.pc;
@@ -243,15 +238,35 @@ async function handleSignal(fromId, signalData) {
                     type: 'answer',
                     sdp: answer.sdp
                 });
+                // Отправляем накопившиеся ICE-кандидаты
+                if (peerInfo.pendingCandidates.length) {
+                    for (const cand of peerInfo.pendingCandidates) {
+                        await pc.addIceCandidate(cand);
+                    }
+                    peerInfo.pendingCandidates = [];
+                }
                 break;
 
             case 'answer':
                 await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: signalData.sdp }));
+                // Отправляем накопившиеся ICE-кандидаты
+                if (peerInfo.pendingCandidates.length) {
+                    for (const cand of peerInfo.pendingCandidates) {
+                        await pc.addIceCandidate(cand);
+                    }
+                    peerInfo.pendingCandidates = [];
+                }
                 break;
 
             case 'ice-candidate':
                 if (signalData.candidate) {
-                    await pc.addIceCandidate(new RTCIceCandidate(signalData.candidate));
+                    const candidate = new RTCIceCandidate(signalData.candidate);
+                    // Если remote description ещё не установлен – буферизируем
+                    if (pc.remoteDescription) {
+                        await pc.addIceCandidate(candidate);
+                    } else {
+                        peerInfo.pendingCandidates.push(candidate);
+                    }
                 }
                 break;
 
@@ -263,18 +278,17 @@ async function handleSignal(fromId, signalData) {
     }
 }
 
-function removePeer(remoteParticipantId) {
-    const peerInfo = peers.get(remoteParticipantId);
+function removePeer(remoteId) {
+    const peerInfo = peers.get(remoteId);
     if (peerInfo) {
         peerInfo.pc.close();
         if (peerInfo.videoElement) {
             peerInfo.videoElement.srcObject = null;
         }
-        // Удаляем контейнер из DOM
-        const container = document.getElementById(`remote-${remoteParticipantId}`);
+        const container = document.getElementById(`remote-${remoteId}`);
         if (container) container.remove();
-        peers.delete(remoteParticipantId);
-        console.log(`Peer ${remoteParticipantId} удалён`);
+        peers.delete(remoteId);
+        console.log(`Peer ${remoteId} удалён`);
     }
 }
 
@@ -294,25 +308,16 @@ async function initLocalMedia() {
         localVideo.srcObject = localStream;
         console.log('Локальный поток получен');
 
-        // Добавляем треки во все существующие пиры
+        // Добавляем треки во все уже созданные пиры
         for (const [remoteId, peerInfo] of peers.entries()) {
             localStream.getTracks().forEach(track => {
                 peerInfo.pc.addTrack(track, localStream);
             });
-            // Если соединение ещё не установлено, но offer уже отправлен, пересоздавать не нужно
-            // Просто добавили треки – при renegotiation понадобится offer/answer.
-            // Упростим: после добавления треков нужно переслать новый offer.
-            // Для простоты: перезапустим ICE (restart ice) или создадим renegotiation.
-            // Но в данном примере предполагаем, что треки добавляются до установки соединения.
-            // Если соединение уже установлено, то нужно создать offer заново.
+            // Если соединение уже в stable и есть remote description, нужно переслать offer (renegotiation)
             if (peerInfo.pc.signalingState === 'stable' && peerInfo.pc.remoteDescription) {
-                // Небольшая хитрость: переотправляем offer с добавлением треков
                 const offer = await peerInfo.pc.createOffer();
                 await peerInfo.pc.setLocalDescription(offer);
-                sendSignal(remoteId, {
-                    type: 'offer',
-                    sdp: offer.sdp
-                });
+                sendSignal(remoteId, { type: 'offer', sdp: offer.sdp });
             }
         }
     } catch (err) {
@@ -321,12 +326,11 @@ async function initLocalMedia() {
     }
 }
 
-// --- Измерение задержки (RTT) ---
+// --- Измерение задержки ---
 startLatencyTestBtn.addEventListener('click', () => {
     if (ws && ws.readyState === WebSocket.OPEN) {
-        const pingTime = sendPing();
+        sendPing();
         latencyResultDiv.innerHTML = '<p>Измерение...</p>';
-        // Можно также измерить задержку через getStats, но здесь используем ping/pong
     } else {
         alert('WebSocket не подключён');
     }
@@ -342,36 +346,29 @@ async function collectStats() {
         let inboundRtpStats = null;
         let candidatePairStats = null;
         stats.forEach(report => {
-            if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                inboundRtpStats = report;
-            }
-            if (report.type === 'candidate-pair' && report.nominated === true) {
-                candidatePairStats = report;
-            }
+            if (report.type === 'inbound-rtp' && report.kind === 'video') inboundRtpStats = report;
+            if (report.type === 'candidate-pair' && report.nominated === true) candidatePairStats = report;
         });
         if (inboundRtpStats) {
             statsText += `Участник ${remoteId.slice(0,6)}:\n`;
-            statsText += `  - Битрейт видео: ${(inboundRtpStats.bytesReceived / 1024).toFixed(2)} KB\n`;
-            statsText += `  - Потеря пакетов: ${inboundRtpStats.packetsLost}\n`;
-            statsText += `  - Джиттер: ${inboundRtpStats.jitter?.toFixed(3)} с\n`;
+            statsText += `  Битрейт видео: ${(inboundRtpStats.bytesReceived / 1024).toFixed(2)} KB\n`;
+            statsText += `  Потеря пакетов: ${inboundRtpStats.packetsLost}\n`;
+            statsText += `  Джиттер: ${inboundRtpStats.jitter?.toFixed(3)} с\n`;
         }
         if (candidatePairStats) {
-            statsText += `  - RTT (ICE): ${(candidatePairStats.currentRoundTripTime * 1000).toFixed(2)} мс\n`;
+            statsText += `  RTT (ICE): ${(candidatePairStats.currentRoundTripTime * 1000).toFixed(2)} мс\n`;
         }
         statsText += '\n';
     }
-    if (statsText === '') statsText = 'Нет активных соединений или статистика недоступна';
+    if (statsText === '') statsText = 'Нет активных соединений';
     webrtcStatsDiv.innerHTML = `<pre>${statsText}</pre>`;
 }
 
-// Периодический сбор статистики (раз в 5 секунд)
 setInterval(() => {
-    if (videoGrid.style.display !== 'none') {
-        collectStats();
-    }
+    if (videoGrid.style.display !== 'none') collectStats();
 }, 5000);
 
-// --- Запуск при подключении ---
+// --- Запуск ---
 joinBtn.addEventListener('click', () => {
     const nickname = nicknameInput.value.trim();
     const roomId = roomIdInput.value.trim();
@@ -379,7 +376,6 @@ joinBtn.addEventListener('click', () => {
         alert('Введите имя и ID комнаты');
         return;
     }
-    // Закрываем предыдущее соединение, если есть
     if (ws) ws.close();
     connectWebSocket(roomId, nickname);
 });
