@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
+import ssl
 from typing import Dict, Optional, List
 
 import websockets
