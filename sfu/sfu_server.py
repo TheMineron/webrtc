@@ -232,11 +232,10 @@ async def handle_client(websocket):
                 await websocket.send(json.dumps({"type": "joined", "room": room_id}))
 
             elif msg_type == "offer":
-                logger.info(f"Received offer from {self.id}")
                 if not participant:
                     await websocket.send(json.dumps({"type": "error", "message": "Not joined"}))
                     continue
-
+                logger.info(f"Received offer from {participant.id}")
                 offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
                 await participant.peer_connection.setRemoteDescription(offer)
 
