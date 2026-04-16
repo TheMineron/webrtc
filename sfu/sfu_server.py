@@ -45,7 +45,7 @@ class Room:
                 logger.info(f"Room {self.id} deleted (empty)")
 
     async def broadcast_track(self, sender_id: str, track, replace_existing: bool = True):
-        logger.debug(
+        logger.info(
             f"broadcast_track: sender={sender_id}, "
             f"kind={track.kind}, "
             f"replace={replace_existing}, "
@@ -118,20 +118,21 @@ class Participant:
             logger.info(f"Signaling state for {self.id}: {state}")
 
     async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True):
-        logger.debug(
+        logger.info(
             f"add_or_replace_track: sender={sender_id}, kind={track.kind}, replace={replace_existing}")
-        logger.debug(f"Current remote_senders for {self.id}: {list(self.remote_senders.keys())}")
+        logger.info(f"Current remote_senders for {self.id}: {list(self.remote_senders.keys())}")
 
         if sender_id not in self.remote_senders:
             self.remote_senders[sender_id] = {}
 
         senders = self.remote_senders[sender_id]
         existing_sender = senders.get(track.kind)
+        logger.info(f"Existing senders for {sender_id}: {list(senders.keys())}")
 
         if existing_sender:
-            logger.debug(f"Existing sender for {sender_id}/{track.kind}: {existing_sender}")
+            logger.info(f"Existing sender for {sender_id}/{track.kind}: {existing_sender}")
         else:
-            logger.debug(f"No existing sender for {sender_id}/{track.kind}")
+            logger.info(f"No existing sender for {sender_id}/{track.kind}")
 
         if replace_existing and existing_sender:
             logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
@@ -154,13 +155,14 @@ class Participant:
             return
         self._renegotiation_pending = True
         try:
+            logger.info(f"Sending renegotiate to {self.id}")
             await self.websocket.send(json.dumps({"type": "renegotiate"}))
-            logger.debug(f"Sent renegotiate notification to {self.id}")
+            logger.info(f"Sent renegotiate notification to {self.id}")
         except Exception as e:
             logger.error(f"Failed to send renegotiate notification: {e}")
 
     async def close(self):
-        logger.debug(f"Closing participant {self.id}, remote_senders: {self.remote_senders}")
+        logger.info(f"Closing participant {self.id}, remote_senders: {self.remote_senders}")
 
         for pid, p in self.room.participants.items():
             if pid != self.id and self.id in p.remote_senders:
@@ -169,7 +171,7 @@ class Participant:
                         logger.warning(f"Sender for {pid} is None, skipping")
                         continue
                     try:
-                        logger.debug(f"Stopping sender {pid}: {sender}")
+                        logger.info(f"Stopping sender {pid}: {sender}")
                         await sender.replaceTrack(None)
                     except Exception as e:
                         logger.warning(f"Failed to stop track sender: {e}", exc_info=True)
@@ -230,6 +232,7 @@ async def handle_client(websocket):
                 await websocket.send(json.dumps({"type": "joined", "room": room_id}))
 
             elif msg_type == "offer":
+                logger.info(f"Received offer from {self.id}")
                 if not participant:
                     await websocket.send(json.dumps({"type": "error", "message": "Not joined"}))
                     continue

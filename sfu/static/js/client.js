@@ -133,7 +133,7 @@ async function connectToSFU(sfuUrl) {
 
         sfuSocket.onmessage = async (event) => {
             const msg = JSON.parse(event.data);
-            console.log('SFU message:', msg);
+            console.log('SFU message received:', msg.type, msg);
 
             if (msg.type === 'joined') {
                 updateStatus('Joined SFU room');
@@ -142,6 +142,7 @@ async function connectToSFU(sfuUrl) {
                 renegotiationInProgress = true;
                 try {
                     const offer = await sfuPeerConnection.createOffer();
+                    console.log('Creating renegotiation offer, current signalingState:', sfuPeerConnection.signalingState);
                     await sfuPeerConnection.setLocalDescription(offer);
                     sfuSocket.send(JSON.stringify({
                         type: 'offer',
@@ -153,6 +154,7 @@ async function connectToSFU(sfuUrl) {
                     renegotiationInProgress = false;
                 }
             } else if (msg.type === 'answer') {
+                console.log('Received answer, resetting renegotiation flag');
                 try {
                     const answer = new RTCSessionDescription({
                         type: 'answer',
@@ -203,6 +205,7 @@ async function setupSFUPeerConnection() {
 
     sfuPeerConnection.ontrack = (event) => {
         console.log('Remote track received:', event.track.kind, 'streams:', event.streams);
+        console.log('ontrack:', event.track.kind, event.streams[0]?.id);
         const stream = event.streams[0];
         if (!stream) {
             console.warn('No stream associated with track');
