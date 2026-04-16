@@ -22,6 +22,7 @@ let localStream = null;
 let roomId = '';
 let participantId = '';
 let nickname = '';
+let isRenegotiating = false; // флаг, чтобы избежать параллельных переговоров
 
 const videosContainer = document.getElementById('videos');
 const statusDiv = document.getElementById('status');
@@ -141,8 +142,12 @@ async function connectToSFU(sfuUrl) {
             if (msg.type === 'joined') {
                 updateStatus('Joined SFU room');
             } else if (msg.type === 'renegotiate') {
-                // SFU требует пересоздать offer из-за добавленных треков
-                if (!sfuPeerConnection) return;
+                // Если уже идёт пересогласование или состояние не stable, игнорируем
+                if (isRenegotiating || !sfuPeerConnection || sfuPeerConnection.signalingState !== 'stable') {
+                    console.warn('Ignoring renegotiate request, state:', sfuPeerConnection?.signalingState);
+                    return;
+                }
+                isRenegotiating = true;
                 try {
                     const offer = await sfuPeerConnection.createOffer();
                     await sfuPeerConnection.setLocalDescription(offer);
@@ -153,14 +158,22 @@ async function connectToSFU(sfuUrl) {
                     updateStatus('Sent renegotiation offer');
                 } catch (err) {
                     console.error('Failed to create renegotiation offer:', err);
+                    isRenegotiating = false;
                 }
             } else if (msg.type === 'answer') {
-                const answer = new RTCSessionDescription({
-                    type: 'answer',
-                    sdp: msg.sdp
-                });
-                await sfuPeerConnection.setRemoteDescription(answer);
-                updateStatus('WebRTC connection established');
+                if (!sfuPeerConnection) return;
+                try {
+                    const answer = new RTCSessionDescription({
+                        type: 'answer',
+                        sdp: msg.sdp
+                    });
+                    await sfuPeerConnection.setRemoteDescription(answer);
+                    updateStatus('WebRTC connection established');
+                } catch (err) {
+                    console.error('Failed to set remote description:', err);
+                } finally {
+                    isRenegotiating = false;
+                }
             } else if (msg.type === 'ice-candidate') {
                 const candidate = new RTCIceCandidate(msg.candidate);
                 await sfuPeerConnection.addIceCandidate(candidate);
@@ -264,6 +277,7 @@ function cleanup() {
     videosContainer.innerHTML = '';
     joinBtn.disabled = false;
     leaveBtn.disabled = true;
+    isRenegotiating = false;
 }
 
 function leaveRoom() {
