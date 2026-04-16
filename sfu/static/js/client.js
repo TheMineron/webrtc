@@ -22,7 +22,7 @@ let localStream = null;
 let roomId = '';
 let participantId = '';
 let nickname = '';
-let isRenegotiating = false; // флаг, чтобы избежать параллельных переговоров
+let renegotiationInProgress = false;
 
 const videosContainer = document.getElementById('videos');
 const statusDiv = document.getElementById('status');
@@ -55,11 +55,6 @@ function addVideoElement(stream, label, isLocal = false) {
     container.appendChild(labelDiv);
     videosContainer.appendChild(container);
     return video;
-}
-
-function removeVideoElement(streamId) {
-    const elem = document.getElementById(`video-${streamId}`);
-    if (elem) elem.remove();
 }
 
 async function joinRoom() {
@@ -142,12 +137,8 @@ async function connectToSFU(sfuUrl) {
             if (msg.type === 'joined') {
                 updateStatus('Joined SFU room');
             } else if (msg.type === 'renegotiate') {
-                // Если уже идёт пересогласование или состояние не stable, игнорируем
-                if (isRenegotiating || !sfuPeerConnection || sfuPeerConnection.signalingState !== 'stable') {
-                    console.warn('Ignoring renegotiate request, state:', sfuPeerConnection?.signalingState);
-                    return;
-                }
-                isRenegotiating = true;
+                if (!sfuPeerConnection || renegotiationInProgress) return;
+                renegotiationInProgress = true;
                 try {
                     const offer = await sfuPeerConnection.createOffer();
                     await sfuPeerConnection.setLocalDescription(offer);
@@ -158,10 +149,9 @@ async function connectToSFU(sfuUrl) {
                     updateStatus('Sent renegotiation offer');
                 } catch (err) {
                     console.error('Failed to create renegotiation offer:', err);
-                    isRenegotiating = false;
+                    renegotiationInProgress = false;
                 }
             } else if (msg.type === 'answer') {
-                if (!sfuPeerConnection) return;
                 try {
                     const answer = new RTCSessionDescription({
                         type: 'answer',
@@ -172,7 +162,7 @@ async function connectToSFU(sfuUrl) {
                 } catch (err) {
                     console.error('Failed to set remote description:', err);
                 } finally {
-                    isRenegotiating = false;
+                    renegotiationInProgress = false;
                 }
             } else if (msg.type === 'ice-candidate') {
                 const candidate = new RTCIceCandidate(msg.candidate);
@@ -220,9 +210,18 @@ async function setupSFUPeerConnection() {
 
     sfuPeerConnection.onconnectionstatechange = () => {
         updateStatus(`SFU connection state: ${sfuPeerConnection.connectionState}`);
-        if (sfuPeerConnection.connectionState === 'failed') {
-            updateStatus('SFU connection failed');
-        }
+    };
+
+    sfuPeerConnection.oniceconnectionstatechange = () => {
+        console.log('ICE connection state:', sfuPeerConnection.iceConnectionState);
+    };
+
+    sfuPeerConnection.onicegatheringstatechange = () => {
+        console.log('ICE gathering state:', sfuPeerConnection.iceGatheringState);
+    };
+
+    sfuPeerConnection.onsignalingstatechange = () => {
+        console.log('Signaling state:', sfuPeerConnection.signalingState);
     };
 }
 
@@ -277,7 +276,7 @@ function cleanup() {
     videosContainer.innerHTML = '';
     joinBtn.disabled = false;
     leaveBtn.disabled = true;
-    isRenegotiating = false;
+    renegotiationInProgress = false;
 }
 
 function leaveRoom() {

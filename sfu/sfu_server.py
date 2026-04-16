@@ -32,13 +32,12 @@ class Room:
                 logger.info(f"Room {self.id} deleted (empty)")
 
     async def broadcast_track(self, sender_id: str, track):
-        """Переслать трек остальным участникам и уведомить их о необходимости ре-переговоров."""
         for pid, p in self.participants.items():
             if pid != sender_id:
                 logger.info(f"Relaying track {track.kind} from {sender_id} to {pid}")
                 relayed_track = relay.subscribe(track)
                 p.peer_connection.addTrack(relayed_track)
-                p.schedule_renegotiation()
+                await p.notify_renegotiation_needed()
 
 
 class Participant:
@@ -47,7 +46,9 @@ class Participant:
         self.room = room
         self.websocket = websocket
         self.peer_connection = RTCPeerConnection()
-        self._renegotiate_task = None
+        # Отключаем проверку consent freshness
+        self.peer_connection._ice_consent_timeout = None
+        self._renegotiation_pending = False
         self._setup_peer_connection_handlers()
 
     def _setup_peer_connection_handlers(self):
@@ -58,30 +59,38 @@ class Participant:
 
         @self.peer_connection.on("connectionstatechange")
         async def on_connectionstatechange():
-            logger.info(f"Connection state for {self.id}: {self.peer_connection.connectionState}")
-            if self.peer_connection.connectionState in ("failed", "closed"):
+            state = self.peer_connection.connectionState
+            logger.info(f"Connection state for {self.id}: {state}")
+            if state in ("failed", "closed"):
                 await self.close()
 
-    def schedule_renegotiation(self):
-        """Запланировать отправку уведомления renegotiate (с дебаунсом)."""
-        if self._renegotiate_task is not None:
-            self._renegotiate_task.cancel()
-        self._renegotiate_task = asyncio.create_task(self._send_renegotiate_after_delay())
+        @self.peer_connection.on("iceconnectionstatechange")
+        async def on_iceconnectionstatechange():
+            state = self.peer_connection.iceConnectionState
+            logger.info(f"ICE connection state for {self.id}: {state}")
 
-    async def _send_renegotiate_after_delay(self):
-        """Отправить renegotiate через небольшую задержку, чтобы агрегировать несколько треков."""
-        await asyncio.sleep(0.2)
+        @self.peer_connection.on("icegatheringstatechange")
+        async def on_icegatheringstatechange():
+            state = self.peer_connection.iceGatheringState
+            logger.info(f"ICE gathering state for {self.id}: {state}")
+
+        @self.peer_connection.on("signalingstatechange")
+        async def on_signalingstatechange():
+            state = self.peer_connection.signalingState
+            logger.info(f"Signaling state for {self.id}: {state}")
+
+    async def notify_renegotiation_needed(self):
+        """Отправляем уведомление, но не чаще одного раза за цикл переговоров."""
+        if self._renegotiation_pending:
+            return
+        self._renegotiation_pending = True
         try:
             await self.websocket.send(json.dumps({"type": "renegotiate"}))
             logger.debug(f"Sent renegotiate notification to {self.id}")
         except Exception as e:
-            logger.error(f"Failed to send renegotiate: {e}")
-        finally:
-            self._renegotiate_task = None
+            logger.error(f"Failed to send renegotiate notification: {e}")
 
     async def close(self):
-        if self._renegotiate_task:
-            self._renegotiate_task.cancel()
         self.room.remove_participant(self.id)
         await self.peer_connection.close()
 
@@ -90,7 +99,6 @@ rooms: Dict[str, Room] = {}
 
 
 def create_ice_candidate_from_js(cand_data: dict) -> RTCIceCandidate:
-    """Создать RTCIceCandidate из словаря, присланного браузером."""
     if hasattr(RTCIceCandidate, "from_js"):
         return RTCIceCandidate.from_js(cand_data)
     else:
@@ -151,6 +159,8 @@ async def handle_client(websocket):
                         "type": "answer",
                         "sdp": participant.peer_connection.localDescription.sdp
                     }))
+                    # Сбрасываем флаг после успешного завершения переговоров
+                    participant._renegotiation_pending = False
 
             elif msg_type == "answer":
                 if not participant:
@@ -158,6 +168,7 @@ async def handle_client(websocket):
                     continue
                 answer = RTCSessionDescription(sdp=data["sdp"], type="answer")
                 await participant.peer_connection.setRemoteDescription(answer)
+                participant._renegotiation_pending = False
 
             elif msg_type == "ice-candidate":
                 if not participant:
