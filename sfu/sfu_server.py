@@ -21,7 +21,7 @@ def _patched_init(self, *args, **kwargs):
 aiortc.rtcicetransport.RTCIceTransport.__init__ = _patched_init
 # ----------------------------------------------------------------------
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sfu")
 
 relay = MediaRelay()
