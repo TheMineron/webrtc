@@ -8,19 +8,6 @@ import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 from aiortc.contrib.media import MediaRelay
 
-# ----------------------------------------------------------------------
-# ПАТЧ: отключение проверки "consent freshness" для всех ICE-транспортов
-import aiortc.rtcicetransport
-
-_original_init = aiortc.rtcicetransport.RTCIceTransport.__init__
-
-def _patched_init(self, *args, **kwargs):
-    _original_init(self, *args, **kwargs)
-    self._consent_timeout = None
-
-aiortc.rtcicetransport.RTCIceTransport.__init__ = _patched_init
-# ----------------------------------------------------------------------
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sfu")
 
@@ -78,6 +65,9 @@ class Participant:
         self.room = room
         self.websocket = websocket
         self.peer_connection = RTCPeerConnection()
+        for transceiver in self.peer_connection.getTransceivers():
+            if hasattr(transceiver.sender, '_transport'):
+                transceiver.sender._transport._consent_timeout = 60
         self.local_tracks: Set = set()
         self.remote_senders: Dict[str, Dict[str, object]] = {}
         self._renegotiation_pending = False
@@ -172,7 +162,12 @@ class Participant:
                         continue
                     try:
                         logger.info(f"Stopping sender {pid}: {sender}")
-                        await sender.replaceTrack(None)
+                        try:
+                            result = sender.replaceTrack(None)
+                            if result is not None and hasattr(result, '__await__'):
+                                await result
+                        except Exception as e:
+                            logger.warning(f"Failed to stop track sender {sender}: {e}")
                     except Exception as e:
                         logger.warning(f"Failed to stop track sender: {e}", exc_info=True)
                 del p.remote_senders[self.id]
