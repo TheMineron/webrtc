@@ -242,6 +242,15 @@ async function setupSFUPeerConnection() {
         updateStatus(`SFU connection state: ${sfuPeerConnection.connectionState}`);
     };
 
+    sfuPeerConnection.onicecandidate = (event) => {
+        if (event.candidate && event.candidate.candidate && event.candidate.candidate.trim() !== "") {
+            sfuSocket.send(JSON.stringify({
+                type: 'ice-candidate',
+                candidate: event.candidate
+            }));
+        }
+    };
+
     sfuPeerConnection.oniceconnectionstatechange = () => {
         console.log('ICE connection state:', sfuPeerConnection.iceConnectionState);
     };

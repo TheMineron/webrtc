@@ -21,7 +21,7 @@ def _patched_init(self, *args, **kwargs):
 aiortc.rtcicetransport.RTCIceTransport.__init__ = _patched_init
 # ----------------------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("sfu")
 
 relay = MediaRelay()
@@ -45,6 +45,13 @@ class Room:
                 logger.info(f"Room {self.id} deleted (empty)")
 
     async def broadcast_track(self, sender_id: str, track, replace_existing: bool = True):
+        logger.debug(
+            f"broadcast_track: sender={sender_id}, "
+            f"kind={track.kind}, "
+            f"replace={replace_existing}, "
+            f"participants={list(self.participants.keys())}"
+        )
+
         for pid, p in self.participants.items():
             if pid != sender_id:
                 logger.info(f"Relaying track {track.kind} from {sender_id} to {pid}")
@@ -111,24 +118,36 @@ class Participant:
             logger.info(f"Signaling state for {self.id}: {state}")
 
     async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True):
+        logger.debug(
+            f"add_or_replace_track: sender={sender_id}, kind={track.kind}, replace={replace_existing}")
+        logger.debug(f"Current remote_senders for {self.id}: {list(self.remote_senders.keys())}")
+
         if sender_id not in self.remote_senders:
             self.remote_senders[sender_id] = {}
 
         senders = self.remote_senders[sender_id]
         existing_sender = senders.get(track.kind)
 
+        if existing_sender:
+            logger.debug(f"Existing sender for {sender_id}/{track.kind}: {existing_sender}")
+        else:
+            logger.debug(f"No existing sender for {sender_id}/{track.kind}")
+
         if replace_existing and existing_sender:
-            logger.info(f"Replacing existing {track.kind} track from {sender_id} for {self.id}")
+            logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
             try:
                 await existing_sender.replaceTrack(track)
+                # после замены не удаляем existing_sender из словаря, он остаётся
             except Exception as e:
-                logger.error(f"Failed to replace track: {e}")
+                logger.error(f"Failed to replace track: {e}", exc_info=True)
+        elif not replace_existing and existing_sender:
+            logger.warning(
+                f"NOT replacing existing {track.kind} track from {sender_id} to {self.id} (replace_existing=False)")
+            # Здесь можно либо ничего не делать, либо добавить второй sender – это приведёт к дублю
         else:
             logger.info(f"Adding new {track.kind} track from {sender_id} to {self.id}")
             sender = self.peer_connection.addTrack(track)
             senders[track.kind] = sender
-
-        await self.notify_renegotiation_needed()
 
     async def notify_renegotiation_needed(self):
         if self._renegotiation_pending:
@@ -141,15 +160,19 @@ class Participant:
             logger.error(f"Failed to send renegotiate notification: {e}")
 
     async def close(self):
-        # Remove our tracks from other participants
+        logger.debug(f"Closing participant {self.id}, remote_senders: {self.remote_senders}")
+
         for pid, p in self.room.participants.items():
             if pid != self.id and self.id in p.remote_senders:
                 for sender in p.remote_senders[self.id].values():
+                    if sender is None:
+                        logger.warning(f"Sender for {pid} is None, skipping")
+                        continue
                     try:
-                        # replaceTrack with None stops sending
+                        logger.debug(f"Stopping sender {pid}: {sender}")
                         await sender.replaceTrack(None)
                     except Exception as e:
-                        logger.warning(f"Failed to stop track sender: {e}")
+                        logger.warning(f"Failed to stop track sender: {e}", exc_info=True)
                 del p.remote_senders[self.id]
                 await p.notify_renegotiation_needed()
 
