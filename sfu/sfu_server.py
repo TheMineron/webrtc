@@ -8,6 +8,20 @@ import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 from aiortc.contrib.media import MediaRelay
 
+# ----------------------------------------------------------------------
+# ПАТЧ: отключение проверки "consent freshness" для всех ICE-транспортов
+import aiortc.rtcicetransport
+
+_original_init = aiortc.rtcicetransport.RTCIceTransport.__init__
+
+def _patched_init(self, *args, **kwargs):
+    _original_init(self, *args, **kwargs)
+    # Устанавливаем таймаут согласия в None, отключая проверку
+    self._consent_timeout = None
+
+aiortc.rtcicetransport.RTCIceTransport.__init__ = _patched_init
+# ----------------------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sfu")
 
@@ -46,8 +60,6 @@ class Participant:
         self.room = room
         self.websocket = websocket
         self.peer_connection = RTCPeerConnection()
-        # Отключаем проверку consent freshness
-        self.peer_connection._ice_consent_timeout = None
         self._renegotiation_pending = False
         self._setup_peer_connection_handlers()
 
@@ -80,7 +92,6 @@ class Participant:
             logger.info(f"Signaling state for {self.id}: {state}")
 
     async def notify_renegotiation_needed(self):
-        """Отправляем уведомление, но не чаще одного раза за цикл переговоров."""
         if self._renegotiation_pending:
             return
         self._renegotiation_pending = True
@@ -159,7 +170,6 @@ async def handle_client(websocket):
                         "type": "answer",
                         "sdp": participant.peer_connection.localDescription.sdp
                     }))
-                    # Сбрасываем флаг после успешного завершения переговоров
                     participant._renegotiation_pending = False
 
             elif msg_type == "answer":
