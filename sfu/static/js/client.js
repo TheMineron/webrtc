@@ -193,7 +193,16 @@ async function connectToSFU(sfuUrl) {
 
 async function setupSFUPeerConnection() {
     sfuPeerConnection = new RTCPeerConnection(pcConfig);
-
+    const transceivers = sfuPeerConnection.getTransceivers();
+    for (const transceiver of transceivers) {
+        if (transceiver.receiver.track.kind === 'video') {
+            const codecs = RTCRtpReceiver.getCapabilities('video').codecs;
+            const vp8 = codecs.find(c => c.mimeType === 'video/VP8');
+            if (vp8) {
+                await transceiver.setCodecPreferences([vp8]);
+            }
+        }
+    }
     sfuPeerConnection.onicecandidate = (event) => {
         if (event.candidate && sfuSocket && sfuSocket.readyState === WebSocket.OPEN) {
             sfuSocket.send(JSON.stringify({
