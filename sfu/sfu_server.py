@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import ssl
-from typing import Dict
+from typing import Dict, Set
 
 import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
@@ -16,7 +16,6 @@ _original_init = aiortc.rtcicetransport.RTCIceTransport.__init__
 
 def _patched_init(self, *args, **kwargs):
     _original_init(self, *args, **kwargs)
-    # Устанавливаем таймаут согласия в None, отключая проверку
     self._consent_timeout = None
 
 aiortc.rtcicetransport.RTCIceTransport.__init__ = _patched_init
@@ -45,13 +44,25 @@ class Room:
                 rooms.pop(self.id, None)
                 logger.info(f"Room {self.id} deleted (empty)")
 
-    async def broadcast_track(self, sender_id: str, track):
+    async def broadcast_track(self, sender_id: str, track, replace_existing: bool = True):
         for pid, p in self.participants.items():
             if pid != sender_id:
                 logger.info(f"Relaying track {track.kind} from {sender_id} to {pid}")
                 relayed_track = relay.subscribe(track)
-                p.peer_connection.addTrack(relayed_track)
-                await p.notify_renegotiation_needed()
+                await p.add_or_replace_track(sender_id, relayed_track, replace_existing)
+
+    async def send_existing_tracks_to_newcomer(self, newcomer_id: str):
+        newcomer = self.participants.get(newcomer_id)
+        if not newcomer:
+            return
+
+        for pid, p in self.participants.items():
+            if pid == newcomer_id:
+                continue
+            for track in p.local_tracks:
+                logger.info(f"Sending existing track {track.kind} from {pid} to newcomer {newcomer_id}")
+                relayed_track = relay.subscribe(track)
+                await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=False)
 
 
 class Participant:
@@ -60,14 +71,22 @@ class Participant:
         self.room = room
         self.websocket = websocket
         self.peer_connection = RTCPeerConnection()
+        self.local_tracks: Set = set()
+        self.remote_senders: Dict[str, Dict[str, object]] = {}
         self._renegotiation_pending = False
+        self._tracks_initialized = False
         self._setup_peer_connection_handlers()
 
     def _setup_peer_connection_handlers(self):
         @self.peer_connection.on("track")
         async def on_track(track):
             logger.info(f"Track received from {self.id}: {track.kind}")
+            self.local_tracks.add(track)
             await self.room.broadcast_track(self.id, track)
+
+            @track.on("ended")
+            def on_ended():
+                self.local_tracks.discard(track)
 
         @self.peer_connection.on("connectionstatechange")
         async def on_connectionstatechange():
@@ -91,6 +110,26 @@ class Participant:
             state = self.peer_connection.signalingState
             logger.info(f"Signaling state for {self.id}: {state}")
 
+    async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True):
+        if sender_id not in self.remote_senders:
+            self.remote_senders[sender_id] = {}
+
+        senders = self.remote_senders[sender_id]
+        existing_sender = senders.get(track.kind)
+
+        if replace_existing and existing_sender:
+            logger.info(f"Replacing existing {track.kind} track from {sender_id} for {self.id}")
+            try:
+                await existing_sender.replaceTrack(track)
+            except Exception as e:
+                logger.error(f"Failed to replace track: {e}")
+        else:
+            logger.info(f"Adding new {track.kind} track from {sender_id} to {self.id}")
+            sender = self.peer_connection.addTrack(track)
+            senders[track.kind] = sender
+
+        await self.notify_renegotiation_needed()
+
     async def notify_renegotiation_needed(self):
         if self._renegotiation_pending:
             return
@@ -102,6 +141,18 @@ class Participant:
             logger.error(f"Failed to send renegotiate notification: {e}")
 
     async def close(self):
+        # Remove our tracks from other participants
+        for pid, p in self.room.participants.items():
+            if pid != self.id and self.id in p.remote_senders:
+                for sender in p.remote_senders[self.id].values():
+                    try:
+                        # replaceTrack with None stops sending
+                        await sender.replaceTrack(None)
+                    except Exception as e:
+                        logger.warning(f"Failed to stop track sender: {e}")
+                del p.remote_senders[self.id]
+                await p.notify_renegotiation_needed()
+
         self.room.remove_participant(self.id)
         await self.peer_connection.close()
 
@@ -163,6 +214,10 @@ async def handle_client(websocket):
                 offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
                 await participant.peer_connection.setRemoteDescription(offer)
 
+                if not participant._tracks_initialized:
+                    await room.send_existing_tracks_to_newcomer(participant.id)
+                    participant._tracks_initialized = True
+
                 if participant.peer_connection.signalingState == "have-remote-offer":
                     answer = await participant.peer_connection.createAnswer()
                     await participant.peer_connection.setLocalDescription(answer)
@@ -184,6 +239,8 @@ async def handle_client(websocket):
                 if not participant:
                     continue
                 cand_data = data["candidate"]
+                if not cand_data or not cand_data.get("candidate"):
+                    continue
                 try:
                     candidate = create_ice_candidate_from_js(cand_data)
                     await participant.peer_connection.addIceCandidate(candidate)

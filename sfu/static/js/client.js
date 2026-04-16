@@ -1,8 +1,8 @@
 const signalingUrl = 'wss://130.193.35.201:8000/ws';
 const pcConfig = {
     iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
+        {urls: 'stun:stun.l.google.com:19302'},
+        {urls: 'stun:stun1.l.google.com:19302'},
         {
             urls: [
                 'turn:178.154.213.197:3478?transport=udp',
@@ -23,6 +23,7 @@ let roomId = '';
 let participantId = '';
 let nickname = '';
 let renegotiationInProgress = false;
+const remoteVideoElements = new Map();
 
 const videosContainer = document.getElementById('videos');
 const statusDiv = document.getElementById('status');
@@ -201,11 +202,40 @@ async function setupSFUPeerConnection() {
     };
 
     sfuPeerConnection.ontrack = (event) => {
-        console.log('Remote track received:', event.track.kind);
+        console.log('Remote track received:', event.track.kind, 'streams:', event.streams);
         const stream = event.streams[0];
-        if (stream) {
-            addVideoElement(stream, `Remote (${stream.id.slice(0, 8)})`);
+        if (!stream) {
+            console.warn('No stream associated with track');
+            return;
         }
+
+        // Если для этого потока уже есть видеоэлемент – ничего не создаём
+        if (remoteVideoElements.has(stream.id)) {
+            console.log(`Stream ${stream.id} already exists, track added automatically`);
+            return;
+        }
+
+        // Создаём новый видеоэлемент и контейнер
+        const video = document.createElement('video');
+        video.srcObject = stream;
+        video.autoplay = true;
+        video.playsInline = true;
+
+        const container = document.createElement('div');
+        container.className = 'video-container';
+        container.id = `video-${stream.id}`;
+
+        const labelDiv = document.createElement('div');
+        labelDiv.className = 'label';
+        // Из stream.id можно извлечь participant_id (сервер задаёт "remote-<participant_id>")
+        const participantId = stream.id.replace('remote-', '');
+        labelDiv.textContent = `Remote (${participantId.slice(0, 8)})`;
+
+        container.appendChild(video);
+        container.appendChild(labelDiv);
+        videosContainer.appendChild(container);
+
+        remoteVideoElements.set(stream.id, video);
     };
 
     sfuPeerConnection.onconnectionstatechange = () => {
@@ -277,11 +307,16 @@ function cleanup() {
     joinBtn.disabled = false;
     leaveBtn.disabled = true;
     renegotiationInProgress = false;
+    remoteVideoElements.forEach((video, streamId) => {
+        const container = document.getElementById(`video-${streamId}`);
+        if (container) container.remove();
+    });
+    remoteVideoElements.clear();
 }
 
 function leaveRoom() {
     if (signalingSocket) {
-        signalingSocket.send(JSON.stringify({ type: 'leave' }));
+        signalingSocket.send(JSON.stringify({type: 'leave'}));
         signalingSocket.close();
         signalingSocket = null;
     }
