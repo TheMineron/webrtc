@@ -10,15 +10,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 from aiortc.contrib.media import MediaRelay
 from aiortc import rtp
 
-# ========== PATCH для RTP-расширений ==========
-original_rtp_extensions_get = rtp.RtpHeaderExtensionsMap.get
-def patched_get(self, extension_profile, extension_value):
-    try:
-        return original_rtp_extensions_get(self, extension_profile, extension_value)
-    except struct.error:
-        return None
-rtp.RtpHeaderExtensionsMap.get = patched_get
-# =============================================
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
