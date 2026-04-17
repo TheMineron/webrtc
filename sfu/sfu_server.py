@@ -8,6 +8,18 @@ import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 from aiortc.contrib.media import MediaRelay
 
+# ========== MONKEY PATCH для исправления ошибки None is not in list ==========
+import aiortc.rtcpeerconnection
+original_and_direction = aiortc.rtcpeerconnection.and_direction
+
+def patched_and_direction(a, b):
+    if a is None or b is None:
+        return 'inactive'
+    return original_and_direction(a, b)
+
+aiortc.rtcpeerconnection.and_direction = patched_and_direction
+# ============================================================================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -24,63 +36,37 @@ class Room:
 
     def add_participant(self, participant: "Participant") -> None:
         self.participants[participant.id] = participant
-        logger.info(
-            f"Participant {participant.id} "
-            f"added to room {self.id}"
-        )
+        logger.info(f"Participant {participant.id} added to room {self.id}")
 
     def remove_participant(self, participant_id: str) -> None:
         if participant_id in self.participants:
             del self.participants[participant_id]
-            logger.info(
-                f"Participant {participant_id}"
-                f" removed from room {self.id}"
-            )
+            logger.info(f"Participant {participant_id} removed from room {self.id}")
 
     def is_empty(self) -> bool:
         return len(self.participants) == 0
 
-    async def broadcast_track(
-            self,
-            sender_id: str,
-            track,
-            replace_existing: bool = True
-    ) -> None:
-        logger.info(
-            f"broadcast_track: sender={sender_id}, "
-            f"kind={track.kind}, replace={replace_existing}, "
-            f"participants={list(self.participants.keys())}"
-        )
-
+    async def broadcast_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
         for pid, participant in self.participants.items():
             if pid != sender_id:
-                logger.info(f"Relaying track {track.kind} from {sender_id} to {pid}")
                 await participant.add_or_replace_track(sender_id, track, replace_existing)
 
     async def send_existing_tracks_to_newcomer(self, newcomer_id: str) -> None:
         newcomer = self.participants.get(newcomer_id)
         if not newcomer:
             return
-
         for pid, participant in self.participants.items():
             if pid == newcomer_id:
                 continue
             for track in participant.local_tracks:
-                logger.info(
-                    f"Sending existing track {track.kind} from {pid} "
-                    f"to newcomer {newcomer_id}"
-                )
                 relayed_track = relay.subscribe(track)
-                await newcomer.add_or_replace_track(
-                    pid, relayed_track, replace_existing=False
-                )
+                await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=False)
 
     def __str__(self) -> str:
         return self.id
 
 
 class Participant:
-
     def __init__(self, participant_id: str, room: Room, websocket) -> None:
         self.id = participant_id
         self.room = room
@@ -88,9 +74,9 @@ class Participant:
         self.peer_connection = RTCPeerConnection()
         self.local_tracks: Set = set()
         self.remote_senders: Dict[str, Dict[str, object]] = {}
-        self.pending_tracks = []
         self._renegotiation_pending = False
         self._tracks_initialized = False
+        self.pending_tracks = []  # (sender_id, track, replace_existing)
         self._setup_peer_connection_handlers()
 
     def _setup_peer_connection_handlers(self) -> None:
@@ -131,18 +117,10 @@ class Participant:
                 for sender_id, track, replace_existing in pending:
                     await self.add_or_replace_track(sender_id, track, replace_existing)
 
-    async def add_or_replace_track(
-            self,
-            sender_id: str,
-            track,
-            replace_existing: bool = True
-    ) -> None:
+    async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
+        # Если состояние не stable, откладываем операцию
         if self.peer_connection.signalingState != "stable":
-            logger.info(
-                f"Deferring add track for {sender_id} "
-                f"({track.kind}) because state is "
-                f"{self.peer_connection.signalingState}"
-            )
+            logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
             self.pending_tracks.append((sender_id, track, replace_existing))
             return
 
@@ -153,7 +131,7 @@ class Participant:
         existing_sender = senders.get(track.kind)
 
         if replace_existing and existing_sender:
-            logger.info(f"Replacing {track.kind} track from {sender_id}")
+            logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
             await existing_sender.replaceTrack(track)
             return
 
@@ -161,6 +139,7 @@ class Participant:
             logger.warning(f"Track {track.kind} already exists, skipping")
             return
 
+        # Новый трек – используем addTrack (работает только в stable)
         logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
         sender = self.peer_connection.addTrack(track)
         if sender is None:
@@ -176,21 +155,22 @@ class Participant:
         try:
             logger.info(f"Sending renegotiate to {self.id}")
             await self.websocket.send(json.dumps({"type": "renegotiate"}))
-            logger.info(f"Sent renegotiate notification to {self.id}")
         except Exception as e:
             logger.error(f"Failed to send renegotiate notification: {e}")
 
     async def close(self) -> None:
         logger.info(f"Closing participant {self.id}, remote_senders: {self.remote_senders}")
-
-        # Уведомляем других участников, что этот участник уходит
+        # Удаляем все senders, принадлежащие этому участнику, из соединений других участников
         for pid, participant in self.room.participants.items():
             if pid != self.id and self.id in participant.remote_senders:
-                # Удаляем все senders, принадлежащие этому участнику
                 for kind, sender in participant.remote_senders[self.id].items():
                     try:
-                        # Останавливаем sender, заменяя трек на None
-                        await sender.replaceTrack(None)
+                        # Останавливаем sender, заменяя трек на None (без await – replaceTrack может быть не асинхронным?)
+                        if sender is not None:
+                            # В aiortc replaceTrack не асинхронный, но мы обернём в await на всякий случай
+                            result = sender.replaceTrack(None)
+                            if result is not None and hasattr(result, "__await__"):
+                                await result
                     except Exception as e:
                         logger.warning(f"Failed to stop track {kind} sender: {e}")
                 del participant.remote_senders[self.id]
@@ -255,10 +235,7 @@ async def handle_client(websocket) -> None:
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
-                await websocket.send(json.dumps({
-                    "type": "error",
-                    "message": "Invalid JSON"
-                }))
+                await websocket.send(json.dumps({"type": "error", "message": "Invalid JSON"}))
                 continue
 
             msg_type = data.get("type")
@@ -267,18 +244,12 @@ async def handle_client(websocket) -> None:
                 room_id = data.get("room")
                 participant_id = data.get("participant_id")
                 if not room_id or not participant_id:
-                    await websocket.send(
-                        json.dumps({
-                            "type": "error",
-                            "message": "room and participant_id required"
-                        })
-                    )
+                    await websocket.send(json.dumps({"type": "error", "message": "room and participant_id required"}))
                     continue
 
                 room = room_manager.get_or_create(room_id)
                 participant = Participant(participant_id, room, websocket)
                 room.add_participant(participant)
-
                 await websocket.send(json.dumps({"type": "joined", "room": room_id}))
 
             elif msg_type == "offer":
@@ -310,10 +281,7 @@ async def handle_client(websocket) -> None:
 
             elif msg_type == "answer":
                 if not participant:
-                    await websocket.send(json.dumps({
-                        "type": "error",
-                        "message": "Not joined"
-                    }))
+                    await websocket.send(json.dumps({"type": "error", "message": "Not joined"}))
                     continue
 
                 answer = RTCSessionDescription(sdp=data["sdp"], type="answer")
@@ -338,12 +306,7 @@ async def handle_client(websocket) -> None:
                 break
 
             else:
-                await websocket.send(
-                    json.dumps({
-                        "type": "error",
-                        "message": f"Unknown message type: {msg_type}"
-                    })
-                )
+                await websocket.send(json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
 
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"WebSocket closed for {participant_id}")
@@ -367,13 +330,7 @@ async def main() -> None:
         ssl_context = None
         proto = "ws"
 
-    async with websockets.serve(
-            handle_client,
-            "0.0.0.0",
-            8001,
-            ssl=ssl_context,
-            max_size=10 ** 7,
-    ):
+    async with websockets.serve(handle_client, "0.0.0.0", 8001, ssl=ssl_context, max_size=10**7):
         logger.info(f"SFU server started on {proto}://0.0.0.0:8001")
         await asyncio.Future()
 
