@@ -92,7 +92,9 @@ class Participant:
         async def on_connectionstatechange():
             state = self.peer_connection.connectionState
             logger.info(f"Connection state for {self.id}: {state}")
-            if state in ("failed", "closed"):
+            if state == "failed":
+                logger.error(f"Connection failed for {self.id}, closing")
+            elif state in ("failed", "closed"):
                 await self.close()
 
         @self.peer_connection.on("iceconnectionstatechange")
