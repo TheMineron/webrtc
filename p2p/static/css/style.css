@@ -61,15 +61,20 @@ video {
 
 #metricsPanel {
     position: fixed;
-    top: 10px;
-    right: 10px;
-    background-color: rgba(0, 0, 0, 0.7);
+    bottom: 20px;
+    right: 20px;
+    background: rgba(0,0,0,0.8);
     color: white;
-    padding: 10px;
+    padding: 15px;
     border-radius: 8px;
-    font-size: 12px;
-    max-width: 300px;
+    font-family: monospace;
+    font-size: 14px;
     z-index: 1000;
+    max-width: 400px;
+}
+#metricsPanel pre {
+    margin: 0;
+    white-space: pre-wrap;
 }
 
 #metricsPanel button {
