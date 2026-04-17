@@ -109,36 +109,37 @@ class Participant:
 
     async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True):
         logger.info(
-            f"add_or_replace_track: sender={sender_id}, kind={track.kind}, replace={replace_existing}")
-        logger.info(f"Current remote_senders for {self.id}: {list(self.remote_senders.keys())}")
+            f"add_or_replace_track: sender={sender_id}, "
+            f"kind={track.kind}, "
+            f"replace={replace_existing}"
+        )
 
         if sender_id not in self.remote_senders:
             self.remote_senders[sender_id] = {}
 
         senders = self.remote_senders[sender_id]
         existing_sender = senders.get(track.kind)
-        logger.info(f"Existing senders for {sender_id}: {list(senders.keys())}")
 
-        if existing_sender:
-            logger.info(f"Existing sender for {sender_id}/{track.kind}: {existing_sender}")
-        else:
-            logger.info(f"No existing sender for {sender_id}/{track.kind}")
+        changed = False  # флаг, что произошло изменение
 
         if replace_existing and existing_sender:
             logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
             try:
                 await existing_sender.replaceTrack(track)
-                # после замены не удаляем existing_sender из словаря, он остаётся
+                changed = True
             except Exception as e:
                 logger.error(f"Failed to replace track: {e}", exc_info=True)
         elif not replace_existing and existing_sender:
             logger.warning(
                 f"NOT replacing existing {track.kind} track from {sender_id} to {self.id} (replace_existing=False)")
-            # Здесь можно либо ничего не делать, либо добавить второй sender – это приведёт к дублю
         else:
             logger.info(f"Adding new {track.kind} track from {sender_id} to {self.id}")
             sender = self.peer_connection.addTrack(track)
             senders[track.kind] = sender
+            changed = True
+
+        if changed:
+            await self.notify_renegotiation_needed()
 
     async def notify_renegotiation_needed(self):
         if self._renegotiation_pending:
