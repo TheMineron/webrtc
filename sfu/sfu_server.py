@@ -60,6 +60,11 @@ class Room:
                 continue
             for track in participant.local_tracks:
                 relayed_track = relay.subscribe(track)
+                if relayed_track is None:
+                    logger.warning(
+                        f"Relay subscribe returned None for track {track.kind} from {pid}")
+                    continue
+                await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=False)
                 await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=False)
 
     def __str__(self) -> str:
@@ -111,11 +116,8 @@ class Participant:
         async def on_signalingstatechange():
             state = self.peer_connection.signalingState
             logger.info(f"Signaling state for {self.id}: {state}")
-            if state == "stable" and self.pending_tracks:
-                pending = self.pending_tracks.copy()
-                self.pending_tracks.clear()
-                for sender_id, track, replace_existing in pending:
-                    await self.add_or_replace_track(sender_id, track, replace_existing)
+            if state == "stable":
+                await self._process_pending_tracks()
 
     async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
         # Если состояние не stable, откладываем операцию
@@ -141,9 +143,13 @@ class Participant:
 
         # Новый трек – используем addTrack (работает только в stable)
         logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
-        sender = self.peer_connection.addTrack(track)
-        if sender is None:
-            logger.error(f"addTrack returned None for {track.kind}")
+        try:
+            sender = self.peer_connection.addTrack(track)
+            if sender is None:
+                logger.error(f"addTrack returned None for {track.kind} from {sender_id}")
+                return
+        except Exception as e:
+            logger.error(f"addTrack failed for {track.kind} from {sender_id}: {e}", exc_info=True)
             return
         senders[track.kind] = sender
         await self.notify_renegotiation_needed()
@@ -178,6 +184,15 @@ class Participant:
 
         self.room.remove_participant(self.id)
         await self.peer_connection.close()
+
+    async def _process_pending_tracks(self) -> None:
+        if not self.pending_tracks:
+            return
+        logger.info(f"Processing {len(self.pending_tracks)} pending tracks for {self.id}")
+        pending = self.pending_tracks.copy()
+        self.pending_tracks.clear()
+        for sender_id, track, replace_existing in pending:
+            await self.add_or_replace_track(sender_id, track, replace_existing)
 
     def __str__(self) -> str:
         return f"{self.id}"
@@ -273,6 +288,7 @@ async def handle_client(websocket) -> None:
                             "type": "answer",
                             "sdp": participant.peer_connection.localDescription.sdp,
                         }))
+                        await participant._process_pending_tracks()
                     except Exception as e:
                         logger.error(f"Failed to create/send answer: {e}", exc_info=True)
                         await participant.notify_renegotiation_needed()
