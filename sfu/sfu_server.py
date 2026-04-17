@@ -77,7 +77,7 @@ class Participant:
         self._renegotiation_pending = False
         self._tracks_initialized = False
         self.pending_tracks = []
-        self._lock = asyncio.Lock()
+
         self._setup_peer_connection_handlers()
 
     def _setup_peer_connection_handlers(self) -> None:
@@ -123,34 +123,34 @@ class Participant:
             await self.notify_renegotiation_needed()
 
     async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
-        async with self._lock:
-            if self.peer_connection.signalingState != "stable":
-                logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
-                self.pending_tracks.append((sender_id, track, replace_existing))
-                return
+        # Если состояние не stable, откладываем операцию
+        if self.peer_connection.signalingState != "stable":
+            logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
+            self.pending_tracks.append((sender_id, track, replace_existing))
+            return
 
-            if sender_id not in self.remote_senders:
-                self.remote_senders[sender_id] = {}
+        if sender_id not in self.remote_senders:
+            self.remote_senders[sender_id] = {}
 
-            senders = self.remote_senders[sender_id]
-            existing_sender = senders.get(track.kind)
+        senders = self.remote_senders[sender_id]
+        existing_sender = senders.get(track.kind)
 
-            if replace_existing and existing_sender:
-                logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
-                await existing_sender.replaceTrack(track)
-                return
+        if replace_existing and existing_sender:
+            logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
+            await existing_sender.replaceTrack(track)
+            return
 
-            if not replace_existing and existing_sender:
-                logger.warning(f"Track {track.kind} already exists, skipping")
-                return
+        if not replace_existing and existing_sender:
+            logger.warning(f"Track {track.kind} already exists, skipping")
+            return
 
-            # Новый трек – используем addTrack (работает только в stable)
-            logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
-            sender = self.peer_connection.addTrack(track)
-            if sender is None:
-                logger.error(f"addTrack returned None for {track.kind}")
-                return
-            senders[track.kind] = sender
+        # Новый трек – используем addTrack (работает только в stable)
+        logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
+        sender = self.peer_connection.addTrack(track)
+        if sender is None:
+            logger.error(f"addTrack returned None for {track.kind}")
+            return
+        senders[track.kind] = sender
 
     async def notify_renegotiation_needed(self) -> None:
         if self._renegotiation_pending:
