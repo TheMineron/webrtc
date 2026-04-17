@@ -8,30 +8,35 @@
 </head>
 <body>
 <div id="join-screen">
-  <h2>🎥 SFU Видеоконференция</h2>
-  <input type="text" id="nickname" placeholder="Ваше имя (например: Алексей)" value="User" required>
-  <input type="text" id="roomId" placeholder="ID комнаты" value="test-room" required>
-  <button id="joinBtn">🔗 Войти в комнату</button>
-  <button id="leaveBtn">🔗 Выйти из комнаты</button>
-  <div style="font-size:12px; margin-top:10px; opacity:0.7;">SFU + WebRTC статистика</div>
+  <h2>Присоединиться к комнате</h2>
+  <input type="text" id="nickname" placeholder="Ваше имя" required>
+  <input type="text" id="roomId" placeholder="ID комнаты" value="test">
+  <button id="joinBtn">Войти</button>
 </div>
 
-<div id="status">Not connected</div>
-<div id="videos"></div>
+<div id="video-grid" style="display: none;">
+  <div class="local-video-container">
+    <video id="localVideo" autoplay muted playsinline></video>
+    <div class="label">Вы (локально)</div>
+  </div>
+  <div id="remoteVideos"></div>
+</div>
+
+<div id="stats" style="display: none;">
+  <h3>Статистика (экспериментальная)</h3>
+  <pre id="statsLog"></pre>
+</div>
 
 <div id="metricsPanel">
-  <h3>📊 МЕТРИКИ КАЧЕСТВА (реального времени)</h3>
-  <div id="latencyResult">
-    <div class="stat-label">⏱️ WebSocket RTT (ping)</div>
-    <pre id="pingDisplay">— ожидание данных —</pre>
-  </div>
+  <h3>📊 Метрики качества</h3>
+  <div id="latencyResult"></div>
   <div id="localStats">
-    <div class="stat-label">📹 ЛОКАЛЬНАЯ статистика (исходящий поток)</div>
-    <pre id="localStatsContent">— ожидание медиа —</pre>
+    <div class="stat-label">📹 Локальная статистика (исходящий поток)</div>
+    <pre id="localStatsContent">— ожидание данных —</pre>
   </div>
   <div id="webrtcStats">
-    <div class="stat-label">🌐 СТАТИСТИКА ОТ SFU (входящий поток)</div>
-    <pre id="remoteStatsContent">— нет соединения —</pre>
+    <div class="stat-label">🌐 Удалённые участники</div>
+    <pre id="webrtcStatsContent">— нет соединений —</pre>
   </div>
 </div>
 

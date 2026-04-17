@@ -25,7 +25,7 @@ let nickname = '';
 let renegotiationInProgress = false;
 const remoteVideoElements = new Map();
 
-// --- Статистика (расширенная) ---
+// --- Статистика ---
 let conferenceStartTime = null;             // момент входа в комнату
 let prevOutboundStats = {                   // для исходящих потоков
     video: {bytes: 0, timestamp: 0, packets: 0},
@@ -38,20 +38,20 @@ let statsHistory = {
     bitrateInVideo: [],      // входящий видео битрейт
     jitter: [],
     rttIce: [],
-    rttWebsocket: [],        // RTT через WebSocket (ping/pong)
     lipSync: []
 };
 
-// --- Элементы DOM (в соответствии с предоставленным HTML) ---
+// --- Элементы DOM ---
 const videosContainer = document.getElementById('videos');
 const statusDiv = document.getElementById('status');
 const joinBtn = document.getElementById('joinBtn');
 const leaveBtn = document.getElementById('leaveBtn');
-const roomInput = document.getElementById('roomId');
-const nameInput = document.getElementById('nickname');
+const roomInput = document.getElementById('roomInput');
+const nameInput = document.getElementById('nameInput');
+const startLatencyTestBtn = document.getElementById('startLatencyTest');
 const latencyResultDiv = document.getElementById('latencyResult');
 const localStatsContent = document.getElementById('localStatsContent');
-const webrtcStatsContent = document.getElementById('remoteStatsContent'); // исправлено с remoteStatsContent
+const remoteStatsContent = document.getElementById('remoteStatsContent');
 
 function updateStatus(text) {
     statusDiv.textContent = text;
@@ -76,7 +76,7 @@ function addVideoElement(stream, label, isLocal = false) {
     return video;
 }
 
-// --- WebSocket ping для измерения RTT (с сохранением в историю) ---
+// --- WebSocket ping для измерения RTT ---
 function sendPing() {
     if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
         const timestamp = Date.now();
@@ -91,18 +91,18 @@ function sendPing() {
     }
 }
 
-// --- Сбор ВСЕЙ статистики (локальной и удалённой) с агрегацией средних ---
+// --- Сбор ВСЕЙ статистики (локальной и удалённой) ---
 async function collectFullStats() {
     if (!sfuPeerConnection) {
         localStatsContent.innerText = '— нет соединения —';
-        webrtcStatsContent.innerText = '— нет соединения —';
+        remoteStatsContent.innerText = '— нет соединения —';
         return;
     }
 
     if (sfuPeerConnection.iceConnectionState !== 'connected' &&
         sfuPeerConnection.iceConnectionState !== 'completed') {
         localStatsContent.innerText = `Ожидание соединения (ICE: ${sfuPeerConnection.iceConnectionState})`;
-        webrtcStatsContent.innerText = `Ожидание соединения (ICE: ${sfuPeerConnection.iceConnectionState})`;
+        remoteStatsContent.innerText = `Ожидание соединения (ICE: ${sfuPeerConnection.iceConnectionState})`;
         return;
     }
 
@@ -223,7 +223,7 @@ async function collectFullStats() {
             remoteText += `📥 Нет входящего видео\n`;
         }
 
-        // RTT (ICE)
+        // RTT
         let rttMs = null;
         if (candidatePair && candidatePair.currentRoundTripTime) {
             rttMs = candidatePair.currentRoundTripTime * 1000;
@@ -233,12 +233,12 @@ async function collectFullStats() {
         if (rttMs !== null) {
             statsHistory.rttIce.push(rttMs);
             if (statsHistory.rttIce.length > 50) statsHistory.rttIce.shift();
-            remoteText += `📡 RTT (ICE): ${rttMs.toFixed(2)} мс\n`;
+            remoteText += `📡 RTT: ${rttMs.toFixed(2)} мс\n`;
         } else {
-            remoteText += `📡 RTT (ICE): неизвестно\n`;
+            remoteText += `📡 RTT: неизвестно\n`;
         }
 
-        // Расхождение аудио/видео
+        // Расхождение аудио/видео (если есть оба inbound-потока)
         if (inboundVideo && inboundAudio && inboundVideo.mediaTime !== undefined && inboundAudio.mediaTime !== undefined) {
             const diff = Math.abs(inboundVideo.mediaTime - inboundAudio.mediaTime) * 1000;
             if (diff < 500) {
@@ -248,7 +248,7 @@ async function collectFullStats() {
             }
         }
 
-        // --- Средние значения за конференцию (включая RTT WebSocket) ---
+        // Средние значения за конференцию
         let durationText = '—';
         if (conferenceStartTime) {
             const sec = (Date.now() - conferenceStartTime) / 1000;
@@ -265,10 +265,8 @@ async function collectFullStats() {
             (statsHistory.bitrateInVideo.reduce((a, b) => a + b, 0) / statsHistory.bitrateInVideo.length).toFixed(2) : '—';
         const avgJitter = statsHistory.jitter.length ?
             (statsHistory.jitter.reduce((a, b) => a + b, 0) / statsHistory.jitter.length).toFixed(2) : '—';
-        const avgRttIce = statsHistory.rttIce.length ?
+        const avgRtt = statsHistory.rttIce.length ?
             (statsHistory.rttIce.reduce((a, b) => a + b, 0) / statsHistory.rttIce.length).toFixed(2) : '—';
-        const avgRttWebsocket = statsHistory.rttWebsocket.length ?
-            (statsHistory.rttWebsocket.reduce((a, b) => a + b, 0) / statsHistory.rttWebsocket.length).toFixed(2) : '—';
         const avgLipSync = statsHistory.lipSync.length ?
             (statsHistory.lipSync.reduce((a, b) => a + b, 0) / statsHistory.lipSync.length).toFixed(2) : '—';
 
@@ -277,19 +275,19 @@ async function collectFullStats() {
         remoteText += `   Исх. битрейт аудио: ${avgOutAudio} kbps\n`;
         remoteText += `   Вх. битрейт видео: ${avgInVideo} kbps\n`;
         remoteText += `   Джиттер: ${avgJitter} мс\n`;
-        remoteText += `   RTT (ICE): ${avgRttIce} мс\n`;
-        remoteText += `   RTT (WebSocket): ${avgRttWebsocket} мс\n`;
+        remoteText += `   RTT: ${avgRtt} мс\n`;
         remoteText += `   Расхождение A/V: ${avgLipSync} мс\n`;
 
-        webrtcStatsContent.innerText = remoteText;
+        remoteStatsContent.innerText = remoteText;
 
     } catch (err) {
         console.error('Ошибка сбора статистики:', err);
         localStatsContent.innerText = 'Ошибка получения статистики';
-        webrtcStatsContent.innerText = 'Ошибка получения статистики';
+        remoteStatsContent.innerText = 'Ошибка получения статистики';
     }
 }
 
+// Запускаем сбор статистики каждые 5 секунд
 let statsInterval = null;
 
 // --- Обработка сигнальных сообщений ---
@@ -335,15 +333,11 @@ async function joinRoom() {
                 updateStatus(`Participant ${msg.participant_id} left`);
                 break;
 
-            case 'pong': {
+            case 'pong':
                 const rtt = Date.now() - msg.timestamp;
-                // Сохраняем RTT WebSocket в историю
-                statsHistory.rttWebsocket.push(rtt);
-                if (statsHistory.rttWebsocket.length > 50) statsHistory.rttWebsocket.shift();
                 latencyResultDiv.innerHTML = `<p>✅ RTT через WebSocket: ${rtt} мс</p>`;
                 console.log(`[PONG] RTT = ${rtt} мс`);
                 break;
-            }
 
             case 'error':
                 console.error('Signaling error:', msg.message);
@@ -366,7 +360,7 @@ async function joinRoom() {
         leaveBtn.disabled = true;
         if (statsInterval) clearInterval(statsInterval);
         localStatsContent.innerText = '— соединение потеряно —';
-        webrtcStatsContent.innerText = '— соединение потеряно —';
+        remoteStatsContent.innerText = '— соединение потеряно —';
     };
 }
 
@@ -385,14 +379,9 @@ async function connectToSFU(sfuUrl) {
                 await setupSFUPeerConnection();
                 await startLocalStream();
                 await createAndSendOffer();
-                // Запускаем периодический сбор статистики каждые 5 секунд
+                // Запускаем периодический сбор статистики
                 if (statsInterval) clearInterval(statsInterval);
                 statsInterval = setInterval(() => collectFullStats(), 5000);
-                websocketPingInterval = setInterval(() => {
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        sendPing();
-                    }
-                }, 3000);
             } catch (err) {
                 console.error('Setup error:', err);
                 updateStatus(`Setup failed: ${err.message}`);
@@ -509,7 +498,7 @@ async function setupSFUPeerConnection() {
     sfuPeerConnection.onconnectionstatechange = () => {
         updateStatus(`SFU connection state: ${sfuPeerConnection.connectionState}`);
         if (sfuPeerConnection.connectionState === 'disconnected' || sfuPeerConnection.connectionState === 'failed') {
-            webrtcStatsContent.innerText = 'Соединение с SFU потеряно';
+            remoteStatsContent.innerText = 'Соединение с SFU потеряно';
         }
     };
 
@@ -570,13 +559,10 @@ function cleanup() {
     remoteVideoElements.clear();
     prevOutboundStats = {video: {bytes: 0, timestamp: 0, packets: 0}, audio: {bytes: 0, timestamp: 0, packets: 0}};
     prevInboundStats = {bytes: 0, timestamp: 0};
-    statsHistory = {
-        bitrateOutVideo: [], bitrateOutAudio: [], bitrateInVideo: [],
-        jitter: [], rttIce: [], rttWebsocket: [], lipSync: []
-    };
+    statsHistory = {bitrateOutVideo: [], bitrateOutAudio: [], bitrateInVideo: [], jitter: [], rttIce: [], lipSync: []};
     conferenceStartTime = null;
     localStatsContent.innerText = '— соединение закрыто —';
-    webrtcStatsContent.innerText = '— соединение закрыто —';
+    remoteStatsContent.innerText = '— соединение закрыто —';
 }
 
 function leaveRoom() {
@@ -589,5 +575,6 @@ function leaveRoom() {
     updateStatus('Disconnected');
 }
 
+startLatencyTestBtn.onclick = sendPing;
 joinBtn.onclick = joinRoom;
 leaveBtn.onclick = leaveRoom;
