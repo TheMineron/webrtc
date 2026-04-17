@@ -6,7 +6,8 @@ const joinBtn = document.getElementById('joinBtn');
 const localVideo = document.getElementById('localVideo');
 const remoteVideosDiv = document.getElementById('remoteVideos');
 const latencyResultDiv = document.getElementById('latencyResult');
-const webrtcStatsDiv = document.getElementById('webrtcStats');
+const localStatsContent = document.getElementById('localStatsContent');
+const webrtcStatsContent = document.getElementById('webrtcStatsContent');
 
 let ws = null;
 let localStream = null;
@@ -15,9 +16,12 @@ let currentNickname = null;
 let currentParticipantId = null;
 let conferenceStartTime = null;
 
-const peers = new Map();
-const prevStatsMap = new Map();      // для входящих байтов
-const prevOutStatsMap = new Map();   // для исходящих байтов
+const peers = new Map();              // remoteId -> { pc, videoElement, stream, dataChannel }
+const prevStatsMap = new Map();       // для удалённых inbound метрик (remoteId -> { bytes, timestamp })
+let prevOutboundStats = {             // для локальной исходящей статистики
+    video: {bytes: 0, timestamp: 0, packets: 0},
+    audio: {bytes: 0, timestamp: 0, packets: 0}
+};
 
 let originalVideoTrack = null;
 let canvasStream = null;
@@ -35,8 +39,7 @@ let dataChannelPingInterval = null;
 let websocketPingInterval = null;
 
 let statsHistory = {
-    bitrateIn: [],
-    bitrateOut: [],
+    bitrate: [],
     jitter: [],
     rttIce: [],
     rttDataChannel: [],
@@ -62,9 +65,9 @@ const pcConfig = {
     iceCandidatePoolSize: 10
 };
 
+// === Вспомогательные функции ===
 async function flashColorOnStream(color, duration = 300) {
     if (!localStream) return;
-
     const videoTrack = localStream.getVideoTracks()[0];
     if (!videoTrack) return;
     originalVideoTrack = videoTrack;
@@ -137,7 +140,8 @@ function connectWebSocket(roomId, nickname) {
         firstVideoFrameTime = null;
         conferenceStartTime = null;
         latencyResultDiv.innerHTML = '';
-        webrtcStatsDiv.innerHTML = '';
+        localStatsContent.innerHTML = '— соединение потеряно —';
+        webrtcStatsContent.innerHTML = '— нет соединений —';
         if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
         e2eTestInProgress = false;
         e2eRemoteMonitor = false;
@@ -145,7 +149,8 @@ function connectWebSocket(roomId, nickname) {
         if (e2eTestInterval) clearInterval(e2eTestInterval);
         if (dataChannelPingInterval) clearInterval(dataChannelPingInterval);
         if (websocketPingInterval) clearInterval(websocketPingInterval);
-        statsHistory = {bitrateIn: [], bitrateOut: [], jitter: [], rttIce: [], rttDataChannel: [], rttWebsocket: [], lipSync: []};
+        statsHistory = {bitrate: [], jitter: [], rttIce: [], rttDataChannel: [], rttWebsocket: [], lipSync: []};
+        prevOutboundStats = {video: {bytes: 0, timestamp: 0, packets: 0}, audio: {bytes: 0, timestamp: 0, packets: 0}};
     };
 }
 
@@ -226,9 +231,7 @@ async function handleSignalingMessage(msg) {
         }
 
         case 'e2e_test_start':
-            if (msg.from_id !== currentParticipantId) {
-                startE2eReceiver(msg.from_id);
-            }
+            if (msg.from_id !== currentParticipantId) startE2eReceiver(msg.from_id);
             break;
         case 'e2e_color_change':
             if (msg.from_id !== currentParticipantId && e2eRemoteMonitor) {
@@ -412,7 +415,6 @@ function removePeer(remoteId) {
         if (container) container.remove();
         peers.delete(remoteId);
         prevStatsMap.delete(remoteId);
-        prevOutStatsMap.delete(remoteId);
     }
 }
 
@@ -555,172 +557,167 @@ function startE2eReceiver(senderId) {
     }, 50);
 }
 
+// === Сбор статистики: удалённая + локальная ===
 async function collectStats() {
-    let statsText = '';
-    const now = Date.now();
-    let currentBitrateIn = 0, currentBitrateOut = 0, currentJitter = 0, currentRttIce = 0, currentLipSync = 0;
-    let hasData = false;
-
-    // --- Локальная статистика (исходящие потоки) ---
+    // ---- 1. Локальная статистика (исходящие потоки) ----
     let localStatsText = '';
-    let localVideoTrack = localStream ? localStream.getVideoTracks()[0] : null;
-    if (localVideoTrack) {
-        const settings = localVideoTrack.getSettings();
-        const resolution = settings.width && settings.height ? `${settings.width}x${settings.height}` : 'неизвестно';
-        const fps = settings.frameRate || '?';
-        localStatsText = `🎥 Вы (локально): ${resolution} @ ${fps} fps\n`;
-    } else {
-        localStatsText = `🎥 Вы (локально): видео не активно\n`;
-    }
+    if (peers.size > 0 && localStream) {
+        // Берём первого активного пира для анализа outbound-треков
+        const anyPeer = peers.values().next().value;
+        if (anyPeer && anyPeer.pc) {
+            const pc = anyPeer.pc;
+            const stats = await pc.getStats();
+            let outVideo = null, outAudio = null;
 
-    // Сбор исходящей статистики (outbound-rtp) по каждому пиру
-    let totalOutBitrate = 0;
-    let outCount = 0;
-    let totalOutPacketsLost = 0;
-
-    for (const [remoteId, peerInfo] of peers.entries()) {
-        const pc = peerInfo.pc;
-        if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') continue;
-
-        const stats = await pc.getStats();
-        let outVideo = null, outAudio = null;
-
-        stats.forEach(report => {
-            if (report.type === 'outbound-rtp' && report.kind === 'video') outVideo = report;
-            if (report.type === 'outbound-rtp' && report.kind === 'audio') outAudio = report;
-        });
-
-        if (outVideo) {
-            const currentBytes = outVideo.bytesSent;
-            const prev = prevOutStatsMap.get(remoteId);
-            if (prev && prev.bytes !== undefined && prev.timestamp) {
-                const bytesDiff = currentBytes - prev.bytes;
-                const timeDiffSec = (now - prev.timestamp) / 1000;
-                if (timeDiffSec > 0 && bytesDiff >= 0) {
-                    const bitrate = (bytesDiff * 8) / timeDiffSec / 1000;
-                    totalOutBitrate += bitrate;
-                    outCount++;
-                    statsHistory.bitrateOut.push(bitrate);
-                    if (statsHistory.bitrateOut.length > 50) statsHistory.bitrateOut.shift();
-                    currentBitrateOut = bitrate;
+            stats.forEach(report => {
+                if (report.type === 'outbound-rtp') {
+                    if (report.kind === 'video') outVideo = report;
+                    if (report.kind === 'audio') outAudio = report;
                 }
+            });
+
+            const now = Date.now();
+
+            // Видео (исходящий)
+            if (outVideo) {
+                const currentBytes = outVideo.bytesSent;
+                const currentPackets = outVideo.packetsSent;
+                const prevVideo = prevOutboundStats.video;
+                let videoBitrate = 0;
+                if (prevVideo.bytes && prevVideo.timestamp) {
+                    const bytesDiff = currentBytes - prevVideo.bytes;
+                    const timeDiffSec = (now - prevVideo.timestamp) / 1000;
+                    if (timeDiffSec > 0 && bytesDiff >= 0) {
+                        videoBitrate = (bytesDiff * 8) / timeDiffSec / 1000; // kbps
+                    }
+                }
+                prevOutboundStats.video = {bytes: currentBytes, timestamp: now, packets: currentPackets};
+
+                const fps = outVideo.framesPerSecond || '—';
+                const width = outVideo.frameWidth || '—';
+                const height = outVideo.frameHeight || '—';
+                const codec = outVideo.codecId ? outVideo.codecId.split('/').pop() : '—';
+
+                localStatsText += `🎥 Видео (исх.):\n`;
+                localStatsText += `   Битрейт: ${videoBitrate.toFixed(2)} kbps\n`;
+                localStatsText += `   Разрешение: ${width}×${height}\n`;
+                localStatsText += `   FPS: ${fps}\n`;
+                localStatsText += `   Отправлено пакетов: ${currentPackets}\n`;
+                localStatsText += `   Кодек: ${codec}\n`;
+            } else {
+                localStatsText += `🎥 Видео: нет активного outbound-трека\n`;
             }
-            prevOutStatsMap.set(remoteId, {bytes: currentBytes, timestamp: now});
-            if (outVideo.packetsLost !== undefined) totalOutPacketsLost += outVideo.packetsLost;
+
+            // Аудио (исходящий)
+            if (outAudio) {
+                const currentBytes = outAudio.bytesSent;
+                const prevAudio = prevOutboundStats.audio;
+                let audioBitrate = 0;
+                if (prevAudio.bytes && prevAudio.timestamp) {
+                    const bytesDiff = currentBytes - prevAudio.bytes;
+                    const timeDiffSec = (now - prevAudio.timestamp) / 1000;
+                    if (timeDiffSec > 0 && bytesDiff >= 0) {
+                        audioBitrate = (bytesDiff * 8) / timeDiffSec / 1000;
+                    }
+                }
+                prevOutboundStats.audio = {bytes: currentBytes, timestamp: now, packets: outAudio.packetsSent};
+                localStatsText += `🎙️ Аудио (исх.):\n`;
+                localStatsText += `   Битрейт: ${audioBitrate.toFixed(2)} kbps\n`;
+                localStatsText += `   Отправлено пакетов: ${outAudio.packetsSent}\n`;
+            } else {
+                localStatsText += `🎙️ Аудио: нет активного outbound-трека\n`;
+            }
+
+            // Доп. информация о локальном захвате
+            const videoTrack = localStream.getVideoTracks()[0];
+            if (videoTrack) {
+                const settings = videoTrack.getSettings();
+                localStatsText += `📷 Камера: ${settings.width || '?'}×${settings.height || '?'} @ ${settings.frameRate || '?'} fps\n`;
+            }
+        } else {
+            localStatsText = 'Ожидание установки соединения...';
         }
-    }
-
-    if (outCount > 0) {
-        const avgOutBitrate = (totalOutBitrate / outCount).toFixed(2);
-        localStatsText += `  📤 Исходящий битрейт (видео): ${avgOutBitrate} kbps\n`;
-        localStatsText += `  📤 Потеряно пакетов (суммарно): ${totalOutPacketsLost}\n`;
     } else {
-        localStatsText += `  📤 Нет активных исходящих потоков\n`;
+        localStatsText = 'Нет активных пиров для анализа исходящего трафика';
     }
+    localStatsContent.innerHTML = localStatsText || '— данные недоступны —';
 
-    statsText += localStatsText + '\n';
+    // ---- 2. Удалённая статистика (входящие потоки) ----
+    let remoteStatsText = '';
+    const nowRemote = Date.now();
+    let hasRemoteData = false;
+    let avgBitrate = 0, avgJitter = 0, avgRttIce = 0, avgLipSync = 0;
 
-    // --- Статистика по удалённым участникам (входящие + исходящие к ним) ---
     for (const [remoteId, peerInfo] of peers.entries()) {
         const pc = peerInfo.pc;
         if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') continue;
 
         const stats = await pc.getStats();
         let inboundVideo = null, inboundAudio = null, candidatePair = null;
-        let outVideo = null, outAudio = null;
 
         stats.forEach(report => {
             if (report.type === 'inbound-rtp' && report.kind === 'video') inboundVideo = report;
             if (report.type === 'inbound-rtp' && report.kind === 'audio') inboundAudio = report;
             if (report.type === 'candidate-pair' && report.nominated === true) candidatePair = report;
-            if (report.type === 'outbound-rtp' && report.kind === 'video') outVideo = report;
-            if (report.type === 'outbound-rtp' && report.kind === 'audio') outAudio = report;
         });
 
-        statsText += `👤 Участник ${remoteId.slice(0, 6)}:\n`;
-
-        // Входящий видео битрейт
         if (inboundVideo) {
             const currentBytes = inboundVideo.bytesReceived;
             const prev = prevStatsMap.get(remoteId);
+            let currentBitrate = 0;
             if (prev && prev.bytes !== undefined && prev.timestamp) {
                 const bytesDiff = currentBytes - prev.bytes;
-                const timeDiffSec = (now - prev.timestamp) / 1000;
+                const timeDiffSec = (nowRemote - prev.timestamp) / 1000;
                 if (timeDiffSec > 0 && bytesDiff >= 0) {
-                    currentBitrateIn = (bytesDiff * 8) / timeDiffSec / 1000;
-                    statsHistory.bitrateIn.push(currentBitrateIn);
-                    if (statsHistory.bitrateIn.length > 50) statsHistory.bitrateIn.shift();
+                    currentBitrate = (bytesDiff * 8) / timeDiffSec / 1000;
+                    statsHistory.bitrate.push(currentBitrate);
+                    if (statsHistory.bitrate.length > 50) statsHistory.bitrate.shift();
                 }
             }
-            prevStatsMap.set(remoteId, {bytes: currentBytes, timestamp: now});
+            prevStatsMap.set(remoteId, {bytes: currentBytes, timestamp: nowRemote});
 
-            currentJitter = (inboundVideo.jitter * 1000);
+            const currentJitter = (inboundVideo.jitter * 1000);
             statsHistory.jitter.push(currentJitter);
             if (statsHistory.jitter.length > 50) statsHistory.jitter.shift();
 
-            statsText += `  📥 Входящий битрейт видео: ${currentBitrateIn.toFixed(2)} kbps\n`;
-            statsText += `  📥 Потеря пакетов (вх): ${inboundVideo.packetsLost}\n`;
-            statsText += `  📥 Джиттер: ${currentJitter.toFixed(2)} мс\n`;
-            hasData = true;
+            remoteStatsText += `👤 Участник ${remoteId.slice(0, 6)}:\n`;
+            remoteStatsText += `   Битрейт видео (вх.): ${currentBitrate.toFixed(2)} kbps\n`;
+            remoteStatsText += `   Потеря пакетов: ${inboundVideo.packetsLost}\n`;
+            remoteStatsText += `   Джиттер: ${currentJitter.toFixed(2)} мс\n`;
+            hasRemoteData = true;
         } else {
-            statsText += `  📥 Нет входящего видео-потока\n`;
+            remoteStatsText += `👤 Участник ${remoteId.slice(0, 6)}: нет видео-потока\n`;
         }
 
-        // Исходящий битрейт к этому участнику
-        if (outVideo) {
-            const currentBytesOut = outVideo.bytesSent;
-            const prevOut = prevOutStatsMap.get(remoteId);
-            if (prevOut && prevOut.bytes !== undefined && prevOut.timestamp) {
-                const bytesDiff = currentBytesOut - prevOut.bytes;
-                const timeDiffSec = (now - prevOut.timestamp) / 1000;
-                if (timeDiffSec > 0 && bytesDiff >= 0) {
-                    const outBitrate = (bytesDiff * 8) / timeDiffSec / 1000;
-                    statsText += `  📤 Исходящий битрейт видео: ${outBitrate.toFixed(2)} kbps\n`;
-                }
-            }
-            prevOutStatsMap.set(remoteId, {bytes: currentBytesOut, timestamp: now});
-            statsText += `  📤 Потеря пакетов (исх): ${outVideo.packetsLost}\n`;
-        } else {
-            statsText += `  📤 Нет исходящего видео-потока\n`;
-        }
-
-        // ICE RTT
         if (candidatePair) {
-            currentRttIce = candidatePair.currentRoundTripTime * 1000;
+            const currentRttIce = candidatePair.currentRoundTripTime * 1000;
             statsHistory.rttIce.push(currentRttIce);
             if (statsHistory.rttIce.length > 50) statsHistory.rttIce.shift();
-            statsText += `  🔄 RTT (ICE): ${currentRttIce.toFixed(2)} мс\n`;
+            remoteStatsText += `   RTT (ICE): ${currentRttIce.toFixed(2)} мс\n`;
         }
 
-        // Расхождение аудио/видео
         if (inboundVideo && inboundAudio && inboundVideo.mediaTime !== undefined && inboundAudio.mediaTime !== undefined) {
-            const videoTime = inboundVideo.mediaTime;
-            const audioTime = inboundAudio.mediaTime;
-            const diff = Math.abs(videoTime - audioTime) * 1000;
+            const diff = Math.abs(inboundVideo.mediaTime - inboundAudio.mediaTime) * 1000;
             if (diff < 500) {
-                currentLipSync = diff;
-                statsHistory.lipSync.push(currentLipSync);
+                statsHistory.lipSync.push(diff);
                 if (statsHistory.lipSync.length > 50) statsHistory.lipSync.shift();
-                statsText += `  🎞️ Расхождение аудио/видео: ${currentLipSync.toFixed(2)} мс\n`;
+                remoteStatsText += `   Расхождение аудио/видео: ${diff.toFixed(2)} мс\n`;
             }
         }
-        statsText += '\n';
+        remoteStatsText += '\n';
     }
 
-    if (!hasData && peers.size === 0) {
-        statsText += 'Нет активных удалённых соединений\n';
+    if (!hasRemoteData) {
+        remoteStatsText = 'Нет активных соединений с удалёнными участниками\n';
     }
 
-    // --- Средние значения за конференцию ---
-    const avgBitrateIn = statsHistory.bitrateIn.length ? (statsHistory.bitrateIn.reduce((a, b) => a + b, 0) / statsHistory.bitrateIn.length).toFixed(2) : '—';
-    const avgBitrateOut = statsHistory.bitrateOut.length ? (statsHistory.bitrateOut.reduce((a, b) => a + b, 0) / statsHistory.bitrateOut.length).toFixed(2) : '—';
-    const avgJitter = statsHistory.jitter.length ? (statsHistory.jitter.reduce((a, b) => a + b, 0) / statsHistory.jitter.length).toFixed(2) : '—';
-    const avgRttIce = statsHistory.rttIce.length ? (statsHistory.rttIce.reduce((a, b) => a + b, 0) / statsHistory.rttIce.length).toFixed(2) : '—';
-    const avgRttData = statsHistory.rttDataChannel.length ? (statsHistory.rttDataChannel.reduce((a, b) => a + b, 0) / statsHistory.rttDataChannel.length).toFixed(2) : '—';
-    const avgLipSync = statsHistory.lipSync.length ? (statsHistory.lipSync.reduce((a, b) => a + b, 0) / statsHistory.lipSync.length).toFixed(2) : '—';
-    const avgRttWebsocket = statsHistory.rttWebsocket.length
-        ? (statsHistory.rttWebsocket.reduce((a, b) => a + b, 0) / statsHistory.rttWebsocket.length).toFixed(2)
-        : '—';
+    // Средние значения за конференцию
+    const avgBitrateVal = statsHistory.bitrate.length ? (statsHistory.bitrate.reduce((a, b) => a + b, 0) / statsHistory.bitrate.length).toFixed(2) : '—';
+    const avgJitterVal = statsHistory.jitter.length ? (statsHistory.jitter.reduce((a, b) => a + b, 0) / statsHistory.jitter.length).toFixed(2) : '—';
+    const avgRttIceVal = statsHistory.rttIce.length ? (statsHistory.rttIce.reduce((a, b) => a + b, 0) / statsHistory.rttIce.length).toFixed(2) : '—';
+    const avgRttDataVal = statsHistory.rttDataChannel.length ? (statsHistory.rttDataChannel.reduce((a, b) => a + b, 0) / statsHistory.rttDataChannel.length).toFixed(2) : '—';
+    const avgLipSyncVal = statsHistory.lipSync.length ? (statsHistory.lipSync.reduce((a, b) => a + b, 0) / statsHistory.lipSync.length).toFixed(2) : '—';
+    const avgRttWebsocketVal = statsHistory.rttWebsocket.length ? (statsHistory.rttWebsocket.reduce((a, b) => a + b, 0) / statsHistory.rttWebsocket.length).toFixed(2) : '—';
     let conferenceDuration = '—';
     if (conferenceStartTime) {
         const durationSec = (Date.now() - conferenceStartTime) / 1000;
@@ -729,18 +726,18 @@ async function collectStats() {
         conferenceDuration = `${minutes}м ${seconds}с`;
     }
 
-    statsText += `\n--- СРЕДНИЕ ЗА ВРЕМЯ КОНФЕРЕНЦИИ (${conferenceDuration}) ---\n`;
-    statsText += `Средний входящий битрейт: ${avgBitrateIn} kbps\n`;
-    statsText += `Средний исходящий битрейт: ${avgBitrateOut} kbps\n`;
-    statsText += `Средний джиттер: ${avgJitter} мс\n`;
-    statsText += `Средний RTT ICE: ${avgRttIce} мс\n`;
-    statsText += `Средний RTT WebSocket: ${avgRttWebsocket} мс\n`;
-    statsText += `Средний RTT DataChannel: ${avgRttData} мс\n`;
-    statsText += `Среднее расхождение аудио/видео: ${avgLipSync} мс\n`;
+    remoteStatsText += `\n📈 СРЕДНИЕ ЗА ВРЕМЯ КОНФЕРЕНЦИИ (${conferenceDuration}):\n`;
+    remoteStatsText += `   Битрейт видео (вх.): ${avgBitrateVal} kbps\n`;
+    remoteStatsText += `   Джиттер: ${avgJitterVal} мс\n`;
+    remoteStatsText += `   RTT ICE: ${avgRttIceVal} мс\n`;
+    remoteStatsText += `   RTT WebSocket: ${avgRttWebsocketVal} мс\n`;
+    remoteStatsText += `   RTT DataChannel: ${avgRttDataVal} мс\n`;
+    remoteStatsText += `   Расхождение аудио/видео: ${avgLipSyncVal} мс\n`;
 
-    webrtcStatsDiv.innerHTML = `<pre>${statsText}</pre>`;
+    webrtcStatsContent.innerHTML = remoteStatsText;
 }
 
+// === Запуск ===
 joinBtn.addEventListener('click', () => {
     const nickname = nicknameInput.value.trim();
     const roomId = roomIdInput.value.trim();
