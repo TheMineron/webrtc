@@ -116,6 +116,7 @@ class Participant:
                 self.pending_tracks.clear()
                 for sender_id, track, replace_existing in pending:
                     await self.add_or_replace_track(sender_id, track, replace_existing)
+                await self.send_offer()
 
     async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
         # Если состояние не stable, откладываем операцию
@@ -146,7 +147,7 @@ class Participant:
             logger.error(f"addTrack returned None for {track.kind}")
             return
         senders[track.kind] = sender
-        await self.notify_renegotiation_needed()
+        await self.send_offer()
 
     async def notify_renegotiation_needed(self) -> None:
         if self._renegotiation_pending:
@@ -178,6 +179,23 @@ class Participant:
 
         self.room.remove_participant(self.id)
         await self.peer_connection.close()
+
+    async def send_offer(self) -> None:
+        if self._renegotiation_pending:
+            return
+        self._renegotiation_pending = True
+        try:
+            logger.info(f"Creating offer for {self.id}")
+            offer = await self.peer_connection.createOffer()
+            await self.peer_connection.setLocalDescription(offer)
+            await self.websocket.send(json.dumps({
+                "type": "offer",
+                "sdp": offer.sdp
+            }))
+            logger.info(f"Offer sent to {self.id}")
+        except Exception as e:
+            logger.error(f"Failed to send offer to {self.id}: {e}")
+            self._renegotiation_pending = False
 
     def __str__(self) -> str:
         return f"{self.id}"
