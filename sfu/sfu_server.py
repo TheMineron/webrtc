@@ -277,9 +277,8 @@ async def handle_client(websocket) -> None:
                     await room.send_existing_tracks_to_newcomer(participant.id)
                     participant._tracks_initialized = True
 
-                # Исправление: всегда создаём answer, если remoteDescription установлен
-                # и нет локального описания (то есть это ответ на renegotiation)
-                if not participant.peer_connection.localDescription:
+                # Всегда отвечаем на offer, если состояние "have-remote-offer"
+                if participant.peer_connection.signalingState == "have-remote-offer":
                     try:
                         answer = await participant.peer_connection.createAnswer()
                         await participant.peer_connection.setLocalDescription(answer)
@@ -294,7 +293,7 @@ async def handle_client(websocket) -> None:
                     finally:
                         participant._renegotiation_pending = False
                 else:
-                    logger.info(f"Local description already exists, skipping answer for {participant.id}")
+                    logger.warning(f"Unexpected signaling state after setRemoteDescription: {participant.peer_connection.signalingState}")
 
             elif msg_type == "answer":
                 if not participant:
