@@ -124,7 +124,7 @@ class Participant:
             await self.notify_renegotiation_needed()
 
     async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
-        with self._lock:
+        async with self._lock:
             if self.peer_connection.signalingState != "stable":
                 logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
                 self.pending_tracks.append((sender_id, track, replace_existing))
