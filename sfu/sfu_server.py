@@ -139,15 +139,12 @@ class Participant:
     ) -> None:
         if self.peer_connection.signalingState != "stable":
             logger.info(
-                f"Deferring add track for {sender_id} ({track.kind}) "
-                f"because signalingState is {self.peer_connection.signalingState}"
+                f"Deferring add track for {sender_id} "
+                f"({track.kind}) because state is "
+                f"{self.peer_connection.signalingState}"
             )
             self.pending_tracks.append((sender_id, track, replace_existing))
             return
-
-        logger.info(
-            f"add_or_replace_track: sender={sender_id}, kind={track.kind}, replace={replace_existing}"
-        )
 
         if sender_id not in self.remote_senders:
             self.remote_senders[sender_id] = {}
@@ -156,7 +153,7 @@ class Participant:
         existing_sender = senders.get(track.kind)
 
         if replace_existing and existing_sender:
-            logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
+            logger.info(f"Replacing {track.kind} track from {sender_id}")
             await existing_sender.replaceTrack(track)
             return
 
@@ -164,13 +161,11 @@ class Participant:
             logger.warning(f"Track {track.kind} already exists, skipping")
             return
 
-        logger.info(f"Adding new {track.kind} transceiver for {sender_id}")
-        transceiver = self.peer_connection.addTransceiver(track.kind, direction='sendonly')
-        if transceiver is None or transceiver.sender is None:
-            logger.error(f"Failed to create transceiver for {track.kind}: transceiver={transceiver}")
+        logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
+        sender = self.peer_connection.addTrack(track)
+        if sender is None:
+            logger.error(f"addTrack returned None for {track.kind}")
             return
-        sender = transceiver.sender
-        await sender.replaceTrack(track)
         senders[track.kind] = sender
         await self.notify_renegotiation_needed()
 
