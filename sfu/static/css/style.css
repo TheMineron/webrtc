@@ -1,124 +1,92 @@
 body {
-    font-family: Arial, sans-serif;
-    margin: 20px;
+    font-family: sans-serif;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
 }
 
-#join-screen {
-    max-width: 400px;
-    margin: 50px auto;
-    text-align: center;
+.controls {
+    margin-bottom: 20px;
 }
 
-#join-screen input, #join-screen button {
-    display: block;
-    width: 100%;
-    margin: 10px 0;
-    padding: 8px;
+input, button {
+    padding: 8px 12px;
+    font-size: 16px;
+    margin-right: 10px;
 }
 
-#video-grid {
+#videos {
     display: flex;
     flex-wrap: wrap;
-    gap: 20px;
-}
-
-.local-video-container, .remote-video-container {
-    position: relative;
-    border: 1px solid #ccc;
-    border-radius: 8px;
-    overflow: hidden;
+    gap: 10px;
 }
 
 video {
-    width: 320px;
-    height: 240px;
-    background: black;
+    width: 300px;
+    height: 200px;
+    background: #333;
+    object-fit: cover;
+    border-radius: 8px;
+}
+
+.video-container {
+    position: relative;
 }
 
 .label {
     position: absolute;
     bottom: 5px;
     left: 5px;
-    background: rgba(0, 0, 0, 0.6);
     color: white;
+    background: rgba(0, 0, 0, 0.5);
     padding: 2px 6px;
-    font-size: 12px;
+    border-radius: 4px;
 }
 
-#stats {
-    margin-top: 30px;
-    border-top: 1px solid #ccc;
-    padding-top: 15px;
-}
-
-#statsLog {
-    background: #f4f4f4;
-    padding: 10px;
-    max-height: 200px;
-    overflow-y: auto;
-    font-size: 12px;
+#status {
+    margin: 10px 0;
+    color: #666;
 }
 
 #metricsPanel {
-    position: fixed;
-    top: 10px;
-    right: 10px;
-    background-color: rgba(0, 0, 0, 0.7);
-    color: white;
+    margin-top: 20px;
+    padding: 15px;
+    border-top: 1px solid #ccc;
+    background: #fafafa;
+    border-radius: 8px;
+    font-family: monospace;
+    font-size: 13px;
+}
+
+#metricsPanel h3 {
+    margin-top: 0;
+    font-size: 18px;
+}
+
+.stat-section {
+    margin-bottom: 20px;
+    border: 1px solid #ddd;
     padding: 10px;
-    border-radius: 8px;
+    border-radius: 6px;
+    background: white;
+}
+
+.stat-label {
+    font-weight: bold;
+    color: #2c3e66;
+    margin-bottom: 8px;
+    font-size: 14px;
+}
+
+pre {
+    margin: 0;
+    white-space: pre-wrap;
+    font-family: monospace;
     font-size: 12px;
-    max-width: 300px;
-    z-index: 1000;
 }
 
-#metricsPanel button {
-    display: block;
-    width: 100%;
-    margin: 5px 0;
-    padding: 5px;
-}
-
-#latencyResult, #webrtcStats {
-    margin-top: 8px;
-    word-wrap: break-word;
-}
-
-#video-grid {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 20px;
-    padding: 20px;
-}
-.local-video-container, .remote-video-container {
-    position: relative;
-    width: 400px;
-    background: #000;
-    border-radius: 8px;
-    overflow: hidden;
-}
-video {
-    width: 100%;
-    height: auto;
-    background: #222;
-}
-.label {
-    position: absolute;
-    bottom: 8px;
-    left: 8px;
-    background: rgba(0,0,0,0.6);
-    color: white;
-    padding: 4px 8px;
+#localStatsContent, #remoteStatsContent {
+    background: #f5f5f5;
+    padding: 8px;
     border-radius: 4px;
-    font-size: 12px;
-}
-#remoteVideos {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 20px;
-}
-#stats, #metricsPanel {
-    margin: 20px;
-    padding: 10px;
-    border: 1px solid #ccc;
 }

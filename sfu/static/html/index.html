@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SFU WebRTC Demo</title>
+  <title>SFU Video Conference</title>
   <style>
       body {
           font-family: sans-serif;
@@ -11,23 +11,19 @@
           margin: 0 auto;
           padding: 20px;
       }
-
       .controls {
           margin-bottom: 20px;
       }
-
       input, button {
           padding: 8px 12px;
           font-size: 16px;
           margin-right: 10px;
       }
-
       #videos {
           display: flex;
           flex-wrap: wrap;
           gap: 10px;
       }
-
       video {
           width: 300px;
           height: 200px;
@@ -35,11 +31,9 @@
           object-fit: cover;
           border-radius: 8px;
       }
-
       .video-container {
           position: relative;
       }
-
       .label {
           position: absolute;
           bottom: 5px;
@@ -49,10 +43,46 @@
           padding: 2px 6px;
           border-radius: 4px;
       }
-
       #status {
           margin: 10px 0;
           color: #666;
+      }
+      #metricsPanel {
+          margin-top: 20px;
+          padding: 15px;
+          border-top: 1px solid #ccc;
+          background: #fafafa;
+          border-radius: 8px;
+          font-family: monospace;
+          font-size: 13px;
+      }
+      #metricsPanel h3 {
+          margin-top: 0;
+          font-size: 18px;
+      }
+      .stat-section {
+          margin-bottom: 20px;
+          border: 1px solid #ddd;
+          padding: 10px;
+          border-radius: 6px;
+          background: white;
+      }
+      .stat-label {
+          font-weight: bold;
+          color: #2c3e66;
+          margin-bottom: 8px;
+          font-size: 14px;
+      }
+      pre {
+          margin: 0;
+          white-space: pre-wrap;
+          font-family: monospace;
+          font-size: 12px;
+      }
+      #localStatsContent, #remoteStatsContent {
+          background: #f5f5f5;
+          padding: 8px;
+          border-radius: 4px;
       }
   </style>
 </head>
@@ -66,12 +96,24 @@
 </div>
 <div id="status">Not connected</div>
 <div id="videos"></div>
-<div id="metrics-panel" style="margin-top: 20px; padding: 10px; border-top: 1px solid #ccc;">
-  <button id="startLatencyTest">📡 Измерить задержку (WebSocket RTT)</button>
-  <div id="latencyResult" style="margin-top: 5px;"></div>
-  <div id="webrtcStats"
-       style="margin-top: 10px; background: #f5f5f5; padding: 8px; font-family: monospace; white-space: pre-wrap;"></div>
+
+<div id="metricsPanel">
+  <h3>📊 Метрики качества</h3>
+  <div class="stat-section">
+    <div class="stat-label">📹 Локальная статистика (исходящий поток)</div>
+    <pre id="localStatsContent">— ожидание данных —</pre>
+  </div>
+  <div class="stat-section">
+    <div class="stat-label">🌐 Статистика от SFU (входящий поток)</div>
+    <pre id="remoteStatsContent">— нет соединения —</pre>
+  </div>
+  <div>
+    <button id="startLatencyTest">📡 Измерить задержку (WebSocket RTT)</button>
+    <div id="latencyResult" style="margin-top: 5px;"></div>
+  </div>
 </div>
-<script src="/static/js/client.js"></script>
+
+<script src="/static/js/client.js">
+</script>
 </body>
 </html>
