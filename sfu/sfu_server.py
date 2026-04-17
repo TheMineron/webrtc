@@ -2,15 +2,23 @@ import asyncio
 import json
 import logging
 import ssl
-import struct
 from typing import Dict, Set, Final, Optional
 
 import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 from aiortc.contrib.media import MediaRelay
-from aiortc import rtp
 
+# ========== MONKEY PATCH для исправления ошибки None is not in list ==========
+import aiortc.rtcpeerconnection
+original_and_direction = aiortc.rtcpeerconnection.and_direction
 
+def patched_and_direction(a, b):
+    if a is None or b is None:
+        return 'inactive'
+    return original_and_direction(a, b)
+
+aiortc.rtcpeerconnection.and_direction = patched_and_direction
+# ============================================================================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -66,10 +74,9 @@ class Participant:
         self.peer_connection = RTCPeerConnection()
         self.local_tracks: Set = set()
         self.remote_senders: Dict[str, Dict[str, object]] = {}
-        self._tracks_initialized = False
-        self.pending_tracks = []
         self._renegotiation_pending = False
-        self._renegotiation_timeout_task = None
+        self._tracks_initialized = False
+        self.pending_tracks = []  # (sender_id, track, replace_existing)
         self._setup_peer_connection_handlers()
 
     def _setup_peer_connection_handlers(self) -> None:
@@ -78,6 +85,7 @@ class Participant:
             logger.info(f"Track received from {self.id}: {track.kind}")
             self.local_tracks.add(track)
             await self.room.broadcast_track(self.id, track)
+
             @track.on("ended")
             def on_ended():
                 self.local_tracks.discard(track)
@@ -110,6 +118,7 @@ class Participant:
                     await self.add_or_replace_track(sender_id, track, replace_existing)
 
     async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
+        # Если состояние не stable, откладываем операцию
         if self.peer_connection.signalingState != "stable":
             logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
             self.pending_tracks.append((sender_id, track, replace_existing))
@@ -122,63 +131,56 @@ class Participant:
         existing_sender = senders.get(track.kind)
 
         if replace_existing and existing_sender:
-            logger.info(f"Replacing {track.kind} track from {sender_id}")
-            existing_sender.replaceTrack(track)   # синхронный метод
+            logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
+            await existing_sender.replaceTrack(track)
             return
 
         if not replace_existing and existing_sender:
             logger.warning(f"Track {track.kind} already exists, skipping")
             return
 
+        # Новый трек – используем addTrack (работает только в stable)
         logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
         sender = self.peer_connection.addTrack(track)
         if sender is None:
             logger.error(f"addTrack returned None for {track.kind}")
             return
         senders[track.kind] = sender
-        await self.send_offer()
+        await self.notify_renegotiation_needed()
 
-    async def send_offer(self) -> None:
+    async def notify_renegotiation_needed(self) -> None:
         if self._renegotiation_pending:
-            logger.info(f"Renegotiation already pending for {self.id}")
-            return
-        if self.peer_connection.signalingState != "stable":
-            logger.warning(f"Cannot send offer, state is {self.peer_connection.signalingState}")
             return
         self._renegotiation_pending = True
         try:
-            offer = await self.peer_connection.createOffer()
-            await self.peer_connection.setLocalDescription(offer)
-            await self.websocket.send(json.dumps({"type": "offer", "sdp": offer.sdp}))
-            logger.info(f"Sent offer to {self.id}")
-            self._renegotiation_timeout_task = asyncio.create_task(self._renegotiation_timeout())
+            logger.info(f"Sending renegotiate to {self.id}")
+            await self.websocket.send(json.dumps({"type": "renegotiate"}))
         except Exception as e:
-            logger.error(f"Failed to send offer: {e}")
-            self._renegotiation_pending = False
-
-    async def _renegotiation_timeout(self):
-        await asyncio.sleep(10)
-        if self._renegotiation_pending:
-            logger.warning(f"Renegotiation timeout for {self.id}, resetting flag")
-            self._renegotiation_pending = False
+            logger.error(f"Failed to send renegotiate notification: {e}")
 
     async def close(self) -> None:
-        logger.info(f"Closing participant {self.id}")
+        logger.info(f"Closing participant {self.id}, remote_senders: {self.remote_senders}")
+        # Удаляем все senders, принадлежащие этому участнику, из соединений других участников
         for pid, participant in self.room.participants.items():
             if pid != self.id and self.id in participant.remote_senders:
                 for kind, sender in participant.remote_senders[self.id].items():
                     try:
-                        if sender:
-                            sender.replaceTrack(None)
+                        # Останавливаем sender, заменяя трек на None (без await – replaceTrack может быть не асинхронным?)
+                        if sender is not None:
+                            # В aiortc replaceTrack не асинхронный, но мы обернём в await на всякий случай
+                            result = sender.replaceTrack(None)
+                            if result is not None and hasattr(result, "__await__"):
+                                await result
                     except Exception as e:
                         logger.warning(f"Failed to stop track {kind} sender: {e}")
                 del participant.remote_senders[self.id]
-                await participant.send_offer()
+                await participant.notify_renegotiation_needed()
+
         self.room.remove_participant(self.id)
         await self.peer_connection.close()
 
     def __str__(self) -> str:
-        return self.id
+        return f"{self.id}"
 
 
 class RoomManager:
@@ -194,7 +196,7 @@ class RoomManager:
         room = self.rooms.get(room_id)
         if room and room.is_empty():
             del self.rooms[room_id]
-            logger.info(f"Room {room_id} deleted")
+            logger.info(f"Room {room_id} deleted (empty)")
 
     def find_room_by_participant_id(self, participant_id: str) -> Optional[Room]:
         for room in self.rooms.values():
@@ -244,6 +246,7 @@ async def handle_client(websocket) -> None:
                 if not room_id or not participant_id:
                     await websocket.send(json.dumps({"type": "error", "message": "room and participant_id required"}))
                     continue
+
                 room = room_manager.get_or_create(room_id)
                 participant = Participant(participant_id, room, websocket)
                 room.add_participant(participant)
@@ -253,6 +256,7 @@ async def handle_client(websocket) -> None:
                 if not participant:
                     await websocket.send(json.dumps({"type": "error", "message": "Not joined"}))
                     continue
+
                 logger.info(f"Received offer from {participant.id}")
                 offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
                 await participant.peer_connection.setRemoteDescription(offer)
@@ -265,28 +269,33 @@ async def handle_client(websocket) -> None:
                     try:
                         answer = await participant.peer_connection.createAnswer()
                         await participant.peer_connection.setLocalDescription(answer)
-                        await websocket.send(json.dumps({"type": "answer", "sdp": answer.sdp}))
+                        await websocket.send(json.dumps({
+                            "type": "answer",
+                            "sdp": participant.peer_connection.localDescription.sdp,
+                        }))
                     except Exception as e:
                         logger.error(f"Failed to create/send answer: {e}", exc_info=True)
-                    participant._renegotiation_pending = False
-                    if participant._renegotiation_timeout_task:
-                        participant._renegotiation_timeout_task.cancel()
+                        await participant.notify_renegotiation_needed()
+                    finally:
+                        participant._renegotiation_pending = False
 
             elif msg_type == "answer":
                 if not participant:
+                    await websocket.send(json.dumps({"type": "error", "message": "Not joined"}))
                     continue
+
                 answer = RTCSessionDescription(sdp=data["sdp"], type="answer")
                 await participant.peer_connection.setRemoteDescription(answer)
                 participant._renegotiation_pending = False
-                if participant._renegotiation_timeout_task:
-                    participant._renegotiation_timeout_task.cancel()
 
             elif msg_type == "ice-candidate":
                 if not participant:
                     continue
+
                 candidate_data = data.get("candidate")
                 if not candidate_data or not candidate_data.get("candidate"):
                     continue
+
                 try:
                     candidate = create_ice_candidate_from_js(candidate_data)
                     await participant.peer_connection.addIceCandidate(candidate)
@@ -317,7 +326,7 @@ async def main() -> None:
         ssl_context.load_cert_chain("cert.pem", "key.pem")
         proto = "wss"
     except FileNotFoundError:
-        logger.warning("SSL certificates not found, using ws://")
+        logger.warning("SSL certificates not found, using unencrypted WebSocket (ws://)")
         ssl_context = None
         proto = "ws"
 
