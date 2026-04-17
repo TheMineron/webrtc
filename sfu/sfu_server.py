@@ -10,12 +10,15 @@ from aiortc.contrib.media import MediaRelay
 
 # ========== MONKEY PATCH для исправления ошибки None is not in list ==========
 import aiortc.rtcpeerconnection
+
 original_and_direction = aiortc.rtcpeerconnection.and_direction
+
 
 def patched_and_direction(a, b):
     if a is None or b is None:
         return 'inactive'
     return original_and_direction(a, b)
+
 
 aiortc.rtcpeerconnection.and_direction = patched_and_direction
 # ============================================================================
@@ -129,11 +132,13 @@ class Participant:
         async def on_negotiation_needed():
             await self.notify_renegotiation_needed()
 
-    async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
+    async def add_or_replace_track(self, sender_id: str, track,
+                                   replace_existing: bool = True) -> None:
 
         async with self._lock:
             if self.peer_connection.signalingState != "stable":
-                logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
+                logger.info(
+                    f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
                 self.pending_tracks.append((sender_id, track, replace_existing))
                 return
 
@@ -271,7 +276,8 @@ async def handle_client(websocket) -> None:
                 room_id = data.get("room")
                 participant_id = data.get("participant_id")
                 if not room_id or not participant_id:
-                    await websocket.send(json.dumps({"type": "error", "message": "room and participant_id required"}))
+                    await websocket.send(json.dumps(
+                        {"type": "error", "message": "room and participant_id required"}))
                     continue
 
                 room = room_manager.get_or_create(room_id)
@@ -279,42 +285,33 @@ async def handle_client(websocket) -> None:
                 room.add_participant(participant)
                 await websocket.send(json.dumps({"type": "joined", "room": room_id}))
 
-
             elif msg_type == "offer":
                 async with participant._lock:
-
                     if participant.peer_connection.signalingState != "stable":
                         logger.warning(
                             f"Offer from {participant.id} ignored, state {participant.peer_connection.signalingState}")
-
                         participant._renegotiation_pending = False
-
                         continue
-
                     logger.info(f"Received offer from {participant.id}")
-
                     offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
-
                     await participant.peer_connection.setRemoteDescription(offer)
 
-                    if not participant._tracks_initialized:
-                        await room.send_existing_tracks_to_newcomer(participant.id)
+                if not participant._tracks_initialized:
+                    await room.send_existing_tracks_to_newcomer(participant.id)
+                    participant._tracks_initialized = True
 
-                        participant._tracks_initialized = True
-
+                async with participant._lock:
                     if participant.peer_connection.signalingState == "have-remote-offer":
-                        answer = await participant.peer_connection.createAnswer()
-
-                        await participant.peer_connection.setLocalDescription(answer)
-
-                        await websocket.send(json.dumps({
-
-                            "type": "answer",
-
-                            "sdp": participant.peer_connection.localDescription.sdp,
-
-                        }))
-
+                        try:
+                            answer = await participant.peer_connection.createAnswer()
+                            await participant.peer_connection.setLocalDescription(answer)
+                            await websocket.send(json.dumps({
+                                "type": "answer",
+                                "sdp": participant.peer_connection.localDescription.sdp,
+                            }))
+                        except Exception as e:
+                            logger.error(f"Failed to create/send answer for {participant.id}: {e}",
+                                         exc_info=True)
                     participant._renegotiation_pending = False
 
             elif msg_type == "answer":
@@ -344,7 +341,8 @@ async def handle_client(websocket) -> None:
                 break
 
             else:
-                await websocket.send(json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
+                await websocket.send(
+                    json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
 
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"WebSocket closed for {participant_id}")
@@ -368,7 +366,7 @@ async def main() -> None:
         ssl_context = None
         proto = "ws"
 
-    async with websockets.serve(handle_client, "0.0.0.0", 8001, ssl=ssl_context, max_size=10**7):
+    async with websockets.serve(handle_client, "0.0.0.0", 8001, ssl=ssl_context, max_size=10 ** 7):
         logger.info(f"SFU server started on {proto}://0.0.0.0:8001")
         await asyncio.Future()
 
