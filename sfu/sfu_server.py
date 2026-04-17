@@ -8,6 +8,7 @@ import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 from aiortc.contrib.media import MediaRelay
 
+# ========== MONKEY PATCH для исправления ошибки None is not in list ==========
 import aiortc.rtcpeerconnection
 
 original_and_direction = aiortc.rtcpeerconnection.and_direction
