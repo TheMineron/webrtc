@@ -4,87 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SFU Video Conference</title>
-  <style>
-      body {
-          font-family: sans-serif;
-          max-width: 1200px;
-          margin: 0 auto;
-          padding: 20px;
-      }
-      .controls {
-          margin-bottom: 20px;
-      }
-      input, button {
-          padding: 8px 12px;
-          font-size: 16px;
-          margin-right: 10px;
-      }
-      #videos {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 10px;
-      }
-      video {
-          width: 300px;
-          height: 200px;
-          background: #333;
-          object-fit: cover;
-          border-radius: 8px;
-      }
-      .video-container {
-          position: relative;
-      }
-      .label {
-          position: absolute;
-          bottom: 5px;
-          left: 5px;
-          color: white;
-          background: rgba(0, 0, 0, 0.5);
-          padding: 2px 6px;
-          border-radius: 4px;
-      }
-      #status {
-          margin: 10px 0;
-          color: #666;
-      }
-      #metricsPanel {
-          margin-top: 20px;
-          padding: 15px;
-          border-top: 1px solid #ccc;
-          background: #fafafa;
-          border-radius: 8px;
-          font-family: monospace;
-          font-size: 13px;
-      }
-      #metricsPanel h3 {
-          margin-top: 0;
-          font-size: 18px;
-      }
-      .stat-section {
-          margin-bottom: 20px;
-          border: 1px solid #ddd;
-          padding: 10px;
-          border-radius: 6px;
-          background: white;
-      }
-      .stat-label {
-          font-weight: bold;
-          color: #2c3e66;
-          margin-bottom: 8px;
-          font-size: 14px;
-      }
-      pre {
-          margin: 0;
-          white-space: pre-wrap;
-          font-family: monospace;
-          font-size: 12px;
-      }
-      #localStatsContent, #remoteStatsContent {
-          background: #f5f5f5;
-          padding: 8px;
-          border-radius: 4px;
-      }
-  </style>
+    <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
 <div id="join-screen">
@@ -110,7 +30,6 @@
     <div class="stat-label">🌐 СТАТИСТИКА ОТ SFU (входящий поток)</div>
     <pre id="remoteStatsContent">— нет соединения —</pre>
   </div>
-  <button id="manualPingBtn">📡 Измерить RTT (WebSocket)</button>
 </div>
 
 <script src="/static/js/client.js">

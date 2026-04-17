@@ -47,11 +47,11 @@ const videosContainer = document.getElementById('videos');
 const statusDiv = document.getElementById('status');
 const joinBtn = document.getElementById('joinBtn');
 const leaveBtn = document.getElementById('leaveBtn');
-const roomInput = document.getElementById('roomInput');
-const nameInput = document.getElementById('nameInput');
+const roomInput = document.getElementById('roomId');
+const nameInput = document.getElementById('nickname');
 const latencyResultDiv = document.getElementById('latencyResult');
 const localStatsContent = document.getElementById('localStatsContent');
-const webrtcStatsContent = document.getElementById('webrtcStatsContent'); // исправлено с remoteStatsContent
+const webrtcStatsContent = document.getElementById('remoteStatsContent'); // исправлено с remoteStatsContent
 
 function updateStatus(text) {
     statusDiv.textContent = text;
