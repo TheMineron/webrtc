@@ -25,10 +25,18 @@ let nickname = '';
 let renegotiationInProgress = false;
 const remoteVideoElements = new Map();
 
+// --- E2E тест переменные ---
+let e2eTestInProgress = false;
+let e2eStartTime = null;
+let e2eRemoteMonitor = false;
+let e2eMonitorInterval = null;
+let originalVideoTrack = null;
+let canvasStream = null;
+
 // --- Метрики и статистика ---
-let conferenceStartTime = null;             // момент входа в комнату (для длительности)
-let callStartTime = null;                  // момент нажатия Join (для Call Setup Time)
-let firstVideoFrameTime = null;             // момент получения первого видео-трека
+let conferenceStartTime = null;
+let callStartTime = null;
+let firstVideoFrameTime = null;
 let prevOutboundStats = {
   video: { bytes: 0, timestamp: 0, packets: 0 },
   audio: { bytes: 0, timestamp: 0, packets: 0 }
@@ -41,12 +49,12 @@ let statsHistory = {
   jitter: [],
   rttIce: [],
   lipSync: [],
-  rttWebsocket: []          // для автоматических измерений RTT через WebSocket
+  rttWebsocket: []
 };
 
-// --- Таймеры ---
 let statsInterval = null;
 let websocketPingInterval = null;
+let e2eTestInterval = null;
 let lastWebsocketRtt = null;
 
 // --- Элементы DOM ---
@@ -84,7 +92,144 @@ function addVideoElement(stream, label, isLocal = false) {
   return video;
 }
 
-// --- WebSocket ping для измерения RTT (ручной и автоматический) ---
+// --- E2E тест: вспышка цветом ---
+async function flashColorOnStream(color, duration = 300) {
+  if (!localStream) return;
+  const videoTrack = localStream.getVideoTracks()[0];
+  if (!videoTrack) return;
+  originalVideoTrack = videoTrack;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 480;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = color;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  canvasStream = canvas.captureStream(30);
+  const colorTrack = canvasStream.getVideoTracks()[0];
+
+  localStream.removeTrack(videoTrack);
+  localStream.addTrack(colorTrack);
+
+  // Заменяем трек в PeerConnection
+  const senders = sfuPeerConnection.getSenders();
+  const videoSender = senders.find(s => s.track?.kind === 'video');
+  if (videoSender) await videoSender.replaceTrack(colorTrack);
+
+  setTimeout(async () => {
+    localStream.removeTrack(colorTrack);
+    localStream.addTrack(originalVideoTrack);
+    if (videoSender) await videoSender.replaceTrack(originalVideoTrack);
+    colorTrack.stop();
+    canvasStream = null;
+  }, duration);
+}
+
+// --- Отправка сигнала через signaling ---
+function sendSignal(targetId, data) {
+  if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
+    signalingSocket.send(JSON.stringify({
+      type: 'signal',
+      target_id: targetId,
+      data: data
+    }));
+  }
+}
+
+// --- Запуск E2E теста (отправитель) ---
+function startE2eVideoLatencyTest() {
+  if (e2eTestInProgress) return;
+  // Находим первого удалённого участника (любого)
+  const remoteParticipants = Object.keys(remoteVideoElements);
+  if (remoteParticipants.length === 0) return;
+  // Получаем ID участника из потока remote-видео (он хранится в метке)
+  // В SFU нет прямого списка ID, поэтому проще: берём первый удалённый поток и из его ID извлекаем participantId
+  // Но у нас нет маппинга. Вместо этого будем хранить participantId для каждого remote video.
+  // Для простоты: при получении ontrack мы можем сохранить связь stream.id -> participantId.
+  // Однако в текущей реализации мы не знаем participantId отправителя. Можно добавить в метаданные.
+  // Альтернатива: выбрать первого участника из списка комнаты, который нам прислал signaling при join.
+  // Временно: отправим сигнал всем, или используем первого попавшегося.
+  // Для демонстрации: отправляем сигнал на самого себя? Нет.
+  // Лучше: при получении `existing_participants` сохраним список ID. Добавим переменную.
+  if (!window.remoteParticipantIds || window.remoteParticipantIds.length === 0) return;
+  const targetId = window.remoteParticipantIds[0];
+  e2eTestInProgress = true;
+
+  sendSignal(targetId, { type: 'e2e_test_start' });
+
+  setTimeout(async () => {
+    if (!localStream) {
+      e2eTestInProgress = false;
+      return;
+    }
+    e2eStartTime = Date.now();
+    const colors = ['red', 'lime', 'blue', 'yellow', 'magenta'];
+    const color = colors[Math.floor(Math.random() * colors.length)];
+    await flashColorOnStream(color, 300);
+    sendSignal(targetId, {
+      type: 'e2e_color_change',
+      timestamp: e2eStartTime,
+      color: color
+    });
+
+    setTimeout(() => {
+      if (e2eTestInProgress) {
+        latencyResultDiv.innerHTML += '<p>⚠️ Тест E2E не завершился (таймаут)</p>';
+        e2eTestInProgress = false;
+        if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
+      }
+    }, 10000);
+  }, 500);
+}
+
+// --- Приёмник E2E теста ---
+function startE2eReceiver(senderId) {
+  if (e2eRemoteMonitor) return;
+  e2eRemoteMonitor = true;
+  // Находим видеоэлемент, соответствующий senderId
+  const videoElement = remoteVideoElements.get(senderId);
+  if (!videoElement) {
+    e2eRemoteMonitor = false;
+    return;
+  }
+
+  let lastColor = null;
+  e2eMonitorInterval = setInterval(() => {
+    if (!e2eRemoteMonitor) {
+      clearInterval(e2eMonitorInterval);
+      return;
+    }
+    const video = videoElement;
+    if (!video.videoWidth || !video.videoHeight) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const centerX = canvas.width / 2;
+    const centerY = canvas.height / 2;
+    const pixel = ctx.getImageData(centerX, centerY, 1, 1).data;
+    const r = pixel[0], g = pixel[1], b = pixel[2];
+    let dominant = '';
+    if (r > 200 && g < 100 && b < 100) dominant = 'red';
+    else if (g > 200 && r < 100 && b < 100) dominant = 'lime';
+    else if (b > 200 && r < 100 && g < 100) dominant = 'blue';
+    else if (r > 200 && g > 200 && b < 100) dominant = 'yellow';
+    else if (r > 200 && g < 100 && b > 200) dominant = 'magenta';
+    if (dominant && dominant !== lastColor && e2eStartTime) {
+      lastColor = dominant;
+      const detectTime = Date.now();
+      const delay = detectTime - e2eStartTime;
+      sendSignal(senderId, { type: 'e2e_result', delay: delay });
+      latencyResultDiv.innerHTML += `<p>🎬 End-to-end задержка видео: ${delay} мс</p>`;
+      e2eRemoteMonitor = false;
+      clearInterval(e2eMonitorInterval);
+    }
+  }, 50);
+}
+
+// --- WebSocket ping для измерения RTT ---
 function sendPing() {
   if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
     const timestamp = Date.now();
@@ -98,7 +243,7 @@ function sendPing() {
   }
 }
 
-// --- Сбор ВСЕЙ статистики (локальной и удалённой) ---
+// --- Сбор статистики (полностью как ранее, но добавлен вывод E2E) ---
 async function collectFullStats() {
   if (!sfuPeerConnection) {
     localStatsContent.innerText = '— нет соединения —';
@@ -117,7 +262,6 @@ async function collectFullStats() {
     const stats = await sfuPeerConnection.getStats();
     const now = Date.now();
 
-    // ---- 1. Локальная статистика (исходящие потоки) ----
     let outVideo = null, outAudio = null;
     stats.forEach(report => {
       if (report.type === 'outbound-rtp') {
@@ -127,8 +271,6 @@ async function collectFullStats() {
     });
 
     let localText = '';
-
-    // Исходящее видео
     if (outVideo) {
       const currentBytes = outVideo.bytesSent;
       const currentPackets = outVideo.packetsSent;
@@ -160,7 +302,6 @@ async function collectFullStats() {
       localText += `🎥 Видео: нет активного outbound-трека\n`;
     }
 
-    // Исходящее аудио
     if (outAudio) {
       const currentBytes = outAudio.bytesSent;
       const prevAudio = prevOutboundStats.audio;
@@ -182,7 +323,6 @@ async function collectFullStats() {
       localText += `🎙️ Аудио: нет активного outbound-трека\n`;
     }
 
-    // Параметры захвата с камеры
     if (localStream) {
       const videoTrack = localStream.getVideoTracks()[0];
       if (videoTrack) {
@@ -192,7 +332,6 @@ async function collectFullStats() {
     }
     localStatsContent.innerText = localText || '— нет данных —';
 
-    // ---- 2. Удалённая статистика (входящие потоки от SFU) ----
     let inboundVideo = null, inboundAudio = null, candidatePair = null, remoteInbound = null;
     stats.forEach(report => {
       if (report.type === 'inbound-rtp' && report.kind === 'video') inboundVideo = report;
@@ -230,7 +369,6 @@ async function collectFullStats() {
       remoteText += `📥 Нет входящего видео\n`;
     }
 
-    // RTT (ICE / remote-inbound)
     let rttMs = null;
     if (candidatePair && candidatePair.currentRoundTripTime) {
       rttMs = candidatePair.currentRoundTripTime * 1000;
@@ -245,7 +383,6 @@ async function collectFullStats() {
       remoteText += `📡 RTT (ICE): неизвестно\n`;
     }
 
-    // Расхождение аудио/видео
     if (inboundVideo && inboundAudio && inboundVideo.mediaTime !== undefined && inboundAudio.mediaTime !== undefined) {
       const diff = Math.abs(inboundVideo.mediaTime - inboundAudio.mediaTime) * 1000;
       if (diff < 500) {
@@ -255,18 +392,15 @@ async function collectFullStats() {
       }
     }
 
-    // RTT WebSocket (последнее автоматическое измерение)
     if (lastWebsocketRtt !== null) {
       remoteText += `🕒 RTT (WebSocket): ${lastWebsocketRtt} мс\n`;
     }
 
-    // Время установления соединения (Call Setup Time)
     if (callStartTime && firstVideoFrameTime) {
       const setupTime = (firstVideoFrameTime - callStartTime).toFixed(2);
       remoteText += `📞 Время установления соединения: ${setupTime} мс\n`;
     }
 
-    // Средние значения за конференцию
     let durationText = '—';
     if (conferenceStartTime) {
       const sec = (Date.now() - conferenceStartTime) / 1000;
@@ -308,7 +442,7 @@ async function collectFullStats() {
   }
 }
 
-// --- Обработка сигнальных сообщений ---
+// --- Обработка сигнальных сообщений (расширена для signal и E2E) ---
 async function joinRoom() {
   roomId = roomInput.value.trim();
   nickname = nameInput.value.trim();
@@ -317,7 +451,6 @@ async function joinRoom() {
     return;
   }
 
-  // Засекаем время начала установления соединения
   callStartTime = performance.now();
   firstVideoFrameTime = null;
 
@@ -347,12 +480,46 @@ async function joinRoom() {
         await connectToSFU(sfuUrl);
         break;
 
+      case 'existing_participants':
+        // Сохраняем список ID удалённых участников для E2E теста
+        window.remoteParticipantIds = msg.participants.map(p => p.id);
+        break;
+
       case 'participant_joined':
         updateStatus(`Participant ${msg.participant.name} joined`);
+        if (window.remoteParticipantIds) {
+          window.remoteParticipantIds.push(msg.participant.id);
+        } else {
+          window.remoteParticipantIds = [msg.participant.id];
+        }
         break;
 
       case 'participant_left':
         updateStatus(`Participant ${msg.participant_id} left`);
+        if (window.remoteParticipantIds) {
+          const idx = window.remoteParticipantIds.indexOf(msg.participant_id);
+          if (idx !== -1) window.remoteParticipantIds.splice(idx, 1);
+        }
+        break;
+
+      case 'signal':
+        // Пересылка сигналов между участниками
+        if (msg.data.type === 'e2e_test_start') {
+          startE2eReceiver(msg.from_id);
+        } else if (msg.data.type === 'e2e_color_change') {
+          if (e2eRemoteMonitor) {
+            e2eStartTime = msg.data.timestamp;
+            console.log(`[E2E] Ожидаем цвет ${msg.data.color}, отправлено в ${e2eStartTime}`);
+          }
+        } else if (msg.data.type === 'e2e_result') {
+          if (e2eTestInProgress) {
+            const delay = msg.data.delay;
+            latencyResultDiv.innerHTML += `<p>🎬 End-to-end задержка видео: ${delay} мс</p>`;
+            e2eTestInProgress = false;
+            if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
+            e2eRemoteMonitor = false;
+          }
+        }
         break;
 
       case 'pong':
@@ -385,6 +552,7 @@ async function joinRoom() {
     leaveBtn.disabled = true;
     if (statsInterval) clearInterval(statsInterval);
     if (websocketPingInterval) clearInterval(websocketPingInterval);
+    if (e2eTestInterval) clearInterval(e2eTestInterval);
     localStatsContent.innerText = '— соединение потеряно —';
     remoteStatsContent.innerText = '— соединение потеряно —';
   };
@@ -406,13 +574,18 @@ async function connectToSFU(sfuUrl) {
         await startLocalStream();
         await createAndSendOffer();
 
-        // Запускаем сбор статистики
         if (statsInterval) clearInterval(statsInterval);
         statsInterval = setInterval(() => collectFullStats(), 5000);
 
-        // Запускаем автоматический пинг WebSocket каждые 3 секунды
         if (websocketPingInterval) clearInterval(websocketPingInterval);
         websocketPingInterval = setInterval(() => sendPing(), 3000);
+
+        if (e2eTestInterval) clearInterval(e2eTestInterval);
+        e2eTestInterval = setInterval(() => {
+          if (window.remoteParticipantIds && window.remoteParticipantIds.length > 0 && !e2eTestInProgress && conferenceStartTime) {
+            startE2eVideoLatencyTest();
+          }
+        }, 30000);
       } catch (err) {
         console.error('Setup error:', err);
         updateStatus(`Setup failed: ${err.message}`);
@@ -480,7 +653,6 @@ async function connectToSFU(sfuUrl) {
 async function setupSFUPeerConnection() {
   sfuPeerConnection = new RTCPeerConnection(pcConfig);
 
-  // Предпочтение VP8
   const transceivers = sfuPeerConnection.getTransceivers();
   for (const transceiver of transceivers) {
     if (transceiver.receiver && transceiver.receiver.track && transceiver.receiver.track.kind === 'video') {
@@ -506,12 +678,10 @@ async function setupSFUPeerConnection() {
     const stream = event.streams[0];
     if (!stream) return;
 
-    // Фиксируем время получения первого видео-кадра
     if (event.track.kind === 'video' && !firstVideoFrameTime && callStartTime) {
       firstVideoFrameTime = performance.now();
       const setupTime = firstVideoFrameTime - callStartTime;
       console.log(`[METRIC] Call Setup Time = ${setupTime.toFixed(2)} ms`);
-      // Выведем в панель при следующем сборе статистики
     }
 
     if (remoteVideoElements.has(stream.id)) return;
@@ -526,12 +696,17 @@ async function setupSFUPeerConnection() {
     container.id = `video-${stream.id}`;
     const labelDiv = document.createElement('div');
     labelDiv.className = 'label';
-    const remoteParticipantId = stream.id.replace('remote-', '');
-    labelDiv.textContent = `Remote (${remoteParticipantId.slice(0, 8)})`;
+    // Пытаемся извлечь ID отправителя из stream.id (обычно SFU формирует "remote-<participantId>")
+    let remoteId = stream.id.replace('remote-', '');
+    if (remoteId === stream.id) remoteId = 'unknown';
+    labelDiv.textContent = `Remote (${remoteId.slice(0, 8)})`;
     container.appendChild(video);
     container.appendChild(labelDiv);
     videosContainer.appendChild(container);
     remoteVideoElements.set(stream.id, video);
+    // Сохраняем соответствие participantId -> video элемент для E2E
+    if (!window.remoteVideoByParticipant) window.remoteVideoByParticipant = new Map();
+    window.remoteVideoByParticipant.set(remoteId, video);
   };
 
   sfuPeerConnection.onconnectionstatechange = () => {
@@ -580,6 +755,8 @@ async function createAndSendOffer() {
 function cleanup() {
   if (statsInterval) clearInterval(statsInterval);
   if (websocketPingInterval) clearInterval(websocketPingInterval);
+  if (e2eTestInterval) clearInterval(e2eTestInterval);
+  if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
   if (sfuPeerConnection) {
     sfuPeerConnection.close();
     sfuPeerConnection = null;
@@ -597,6 +774,7 @@ function cleanup() {
   leaveBtn.disabled = true;
   renegotiationInProgress = false;
   remoteVideoElements.clear();
+  if (window.remoteVideoByParticipant) window.remoteVideoByParticipant.clear();
   prevOutboundStats = { video: { bytes: 0, timestamp: 0, packets: 0 }, audio: { bytes: 0, timestamp: 0, packets: 0 } };
   prevInboundStats = { bytes: 0, timestamp: 0 };
   statsHistory = { bitrateOutVideo: [], bitrateOutAudio: [], bitrateInVideo: [], jitter: [], rttIce: [], lipSync: [], rttWebsocket: [] };
@@ -604,6 +782,9 @@ function cleanup() {
   callStartTime = null;
   firstVideoFrameTime = null;
   lastWebsocketRtt = null;
+  e2eTestInProgress = false;
+  e2eRemoteMonitor = false;
+  e2eStartTime = null;
   localStatsContent.innerText = '— соединение закрыто —';
   remoteStatsContent.innerText = '— соединение закрыто —';
   latencyResultDiv.innerHTML = '';
@@ -621,7 +802,6 @@ function leaveRoom() {
 
 startLatencyTestBtn.onclick = () => {
   sendPing();
-  // Вручную показываем индикацию, ответ придёт в onmessage
   latencyResultDiv.innerHTML = '<p>⏱️ Измерение RTT (ручное)...</p>';
 };
 joinBtn.onclick = joinRoom;

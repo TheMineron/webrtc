@@ -216,10 +216,43 @@ class LeaveCommand(Command):
         return ctx.current_room, ctx.current_participant
 
 
+class SignalCommand(Command):
+    async def handle(self, ctx: CommandContext, data: dict) -> RoomParticipantPair:
+        target_id = data.get("target_id")
+        signal_data = data.get("data")
+        if not target_id or not signal_data:
+            await safe_send_json(ctx.websocket, {
+                "type": "error", "message": "target_id and data required"
+            })
+            return ctx.current_room, ctx.current_participant
+
+        room = ctx.current_room
+        if not room:
+            await safe_send_json(ctx.websocket, {
+                "type": "error", "message": "Not in a room"
+            })
+            return ctx.current_room, ctx.current_participant
+
+        target = room.participants.get(target_id)
+        if not target:
+            await safe_send_json(ctx.websocket, {
+                "type": "error", "message": "Target participant not found"
+            })
+            return ctx.current_room, ctx.current_participant
+
+        await safe_send_json(target.websocket, {
+            "type": "signal",
+            "from_id": ctx.current_participant.id,
+            "data": signal_data
+        })
+        return ctx.current_room, ctx.current_participant
+
+
 COMMAND_HANDLERS: Final[dict[str, CommandHandler]] = {
     "join": JoinCommand().handle,
     "ping": PingCommand().handle,
     "leave": LeaveCommand().handle,
+    "signal": SignalCommand().handle
 }
 
 
