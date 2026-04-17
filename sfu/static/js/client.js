@@ -23,7 +23,7 @@ let roomId = '';
 let participantId = '';
 let nickname = '';
 let renegotiationInProgress = false;
-const remoteVideoElements = new Map();
+const remoteVideoElements = new Map(); // key = stream.id, value = video element
 
 // --- E2E тест переменные ---
 let e2eTestInProgress = false;
@@ -32,7 +32,7 @@ let e2eRemoteMonitor = false;
 let e2eMonitorInterval = null;
 let originalVideoTrack = null;
 let canvasStream = null;
-let lastE2eResult = null;        // для отображения в статистике
+let lastE2eResult = null;
 
 // --- Метрики и статистика ---
 let conferenceStartTime = null;
@@ -51,7 +51,7 @@ let statsHistory = {
   rttIce: [],
   lipSync: [],
   rttWebsocket: [],
-  e2eDelay: []                // массив для хранения результатов E2E
+  e2eDelay: []
 };
 
 let statsInterval = null;
@@ -185,33 +185,36 @@ function startE2eVideoLatencyTest() {
   }, 500);
 }
 
-// --- Приёмник E2E теста ---
+// --- Приёмник E2E теста (использует первый попавшийся удалённый видеоэлемент) ---
 function startE2eReceiver(senderId) {
   if (e2eRemoteMonitor) {
     console.log('[E2E] Уже в режиме мониторинга');
     return;
   }
   console.log(`[E2E] Запуск приёмника для отправителя ${senderId}`);
-  e2eRemoteMonitor = true;
-  // Получаем видеоэлемент по ID отправителя
-  const videoElement = window.remoteVideoByParticipant?.get(senderId);
-  if (!videoElement) {
-    console.warn(`[E2E] Не найден видеоэлемент для отправителя ${senderId}`);
-    e2eRemoteMonitor = false;
+
+  // Берём первый доступный удалённый видеоэлемент
+  if (remoteVideoElements.size === 0) {
+    console.warn('[E2E] Нет удалённых видеоэлементов');
     return;
   }
+  const videoElement = Array.from(remoteVideoElements.values())[0];
+  console.log('[E2E] Используем видеоэлемент:', videoElement);
 
+  e2eRemoteMonitor = true;
   let lastColor = null;
+  e2eStartTime = null; // будет установлен из e2e_color_change
+
+  if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
   e2eMonitorInterval = setInterval(() => {
     if (!e2eRemoteMonitor) {
       clearInterval(e2eMonitorInterval);
       return;
     }
+    if (!e2eStartTime) return; // ещё не получили цвет
+
     const video = videoElement;
-    if (!video.videoWidth || !video.videoHeight) {
-      // console.log('[E2E] Видео ещё не имеет размера');
-      return;
-    }
+    if (!video.videoWidth || !video.videoHeight) return;
     const canvas = document.createElement('canvas');
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
@@ -227,13 +230,12 @@ function startE2eReceiver(senderId) {
     else if (b > 200 && r < 100 && g < 100) dominant = 'blue';
     else if (r > 200 && g > 200 && b < 100) dominant = 'yellow';
     else if (r > 200 && g < 100 && b > 200) dominant = 'magenta';
-    if (dominant && dominant !== lastColor && e2eStartTime) {
+    if (dominant && dominant !== lastColor) {
       lastColor = dominant;
       const detectTime = Date.now();
       const delay = detectTime - e2eStartTime;
       console.log(`[E2E] Обнаружен цвет ${dominant}, задержка = ${delay} мс`);
       sendSignal(senderId, { type: 'e2e_result', delay: delay });
-      // Сохраняем результат для отображения в статистике
       lastE2eResult = delay;
       statsHistory.e2eDelay.push(delay);
       if (statsHistory.e2eDelay.length > 10) statsHistory.e2eDelay.shift();
@@ -258,7 +260,7 @@ function sendPing() {
   }
 }
 
-// --- Сбор статистики (добавлен вывод E2E) ---
+// --- Сбор статистики (с выводом E2E) ---
 async function collectFullStats() {
   if (!sfuPeerConnection) {
     localStatsContent.innerText = '— нет соединения —';
@@ -416,7 +418,6 @@ async function collectFullStats() {
       remoteText += `📞 Время установления соединения: ${setupTime} мс\n`;
     }
 
-    // --- Вывод последней E2E задержки ---
     if (lastE2eResult !== null) {
       remoteText += `🎬 End-to-end задержка видео: ${lastE2eResult} мс (последний тест)\n`;
     }
@@ -725,16 +726,12 @@ async function setupSFUPeerConnection() {
     container.id = `video-${stream.id}`;
     const labelDiv = document.createElement('div');
     labelDiv.className = 'label';
-    let remoteId = stream.id.replace('remote-', '');
-    if (remoteId === stream.id) remoteId = 'unknown';
-    labelDiv.textContent = `Remote (${remoteId.slice(0, 8)})`;
+    labelDiv.textContent = `Remote (${stream.id.slice(0, 8)})`;
     container.appendChild(video);
     container.appendChild(labelDiv);
     videosContainer.appendChild(container);
     remoteVideoElements.set(stream.id, video);
-    if (!window.remoteVideoByParticipant) window.remoteVideoByParticipant = new Map();
-    window.remoteVideoByParticipant.set(remoteId, video);
-    console.log(`[E2E] Зарегистрирован видеоэлемент для участника ${remoteId}`);
+    console.log('[E2E] Добавлен удалённый видеоэлемент, всего:', remoteVideoElements.size);
   };
 
   sfuPeerConnection.onconnectionstatechange = () => {
@@ -802,7 +799,6 @@ function cleanup() {
   leaveBtn.disabled = true;
   renegotiationInProgress = false;
   remoteVideoElements.clear();
-  if (window.remoteVideoByParticipant) window.remoteVideoByParticipant.clear();
   prevOutboundStats = { video: { bytes: 0, timestamp: 0, packets: 0 }, audio: { bytes: 0, timestamp: 0, packets: 0 } };
   prevInboundStats = { bytes: 0, timestamp: 0 };
   statsHistory = { bitrateOutVideo: [], bitrateOutAudio: [], bitrateInVideo: [], jitter: [], rttIce: [], lipSync: [], rttWebsocket: [], e2eDelay: [] };
