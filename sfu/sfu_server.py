@@ -10,15 +10,12 @@ from aiortc.contrib.media import MediaRelay
 
 # ========== MONKEY PATCH для исправления ошибки None is not in list ==========
 import aiortc.rtcpeerconnection
-
 original_and_direction = aiortc.rtcpeerconnection.and_direction
-
 
 def patched_and_direction(a, b):
     if a is None or b is None:
         return 'inactive'
     return original_and_direction(a, b)
-
 
 aiortc.rtcpeerconnection.and_direction = patched_and_direction
 # ============================================================================
@@ -120,29 +117,10 @@ class Participant:
                 for sender_id, track, replace_existing in pending:
                     await self.add_or_replace_track(sender_id, track, replace_existing)
 
-        @self.peer_connection.on("icecandidate")
-        async def on_icecandidate(candidate):
-            if candidate:
-                logger.info(f"Sending ICE candidate from {self.id}")
-                await self.websocket.send(json.dumps({
-                    "type": "ice-candidate",
-                    "candidate": {
-                        "candidate": candidate.candidate,
-                        "sdpMid": candidate.sdpMid,
-                        "sdpMLineIndex": candidate.sdpMLineIndex,
-                    }
-                }))
-
-        @self.peer_connection.on("negotiationneeded")
-        async def on_negotiationneeded():
-            logger.info(f"Negotiation needed for {self.id}")
-            await self.notify_renegotiation_needed()
-
-    async def add_or_replace_track(self, sender_id: str, track,
-                                   replace_existing: bool = True) -> None:
+    async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
+        # Если состояние не stable, откладываем операцию
         if self.peer_connection.signalingState != "stable":
-            logger.info(
-                f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
+            logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
             self.pending_tracks.append((sender_id, track, replace_existing))
             return
 
@@ -161,13 +139,14 @@ class Participant:
             logger.warning(f"Track {track.kind} already exists, skipping")
             return
 
+        # Новый трек – используем addTrack (работает только в stable)
         logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
         sender = self.peer_connection.addTrack(track)
         if sender is None:
             logger.error(f"addTrack returned None for {track.kind}")
             return
         senders[track.kind] = sender
-        # renegotiation будет инициировано событием negotiationneeded
+        await self.notify_renegotiation_needed()
 
     async def notify_renegotiation_needed(self) -> None:
         if self._renegotiation_pending:
@@ -178,8 +157,6 @@ class Participant:
             await self.websocket.send(json.dumps({"type": "renegotiate"}))
         except Exception as e:
             logger.error(f"Failed to send renegotiate notification: {e}")
-        finally:
-            self._renegotiation_pending = False
 
     async def close(self) -> None:
         logger.info(f"Closing participant {self.id}, remote_senders: {self.remote_senders}")
@@ -188,7 +165,9 @@ class Participant:
             if pid != self.id and self.id in participant.remote_senders:
                 for kind, sender in participant.remote_senders[self.id].items():
                     try:
+                        # Останавливаем sender, заменяя трек на None (без await – replaceTrack может быть не асинхронным?)
                         if sender is not None:
+                            # В aiortc replaceTrack не асинхронный, но мы обернём в await на всякий случай
                             result = sender.replaceTrack(None)
                             if result is not None and hasattr(result, "__await__"):
                                 await result
@@ -265,8 +244,7 @@ async def handle_client(websocket) -> None:
                 room_id = data.get("room")
                 participant_id = data.get("participant_id")
                 if not room_id or not participant_id:
-                    await websocket.send(json.dumps(
-                        {"type": "error", "message": "room and participant_id required"}))
+                    await websocket.send(json.dumps({"type": "error", "message": "room and participant_id required"}))
                     continue
 
                 room = room_manager.get_or_create(room_id)
@@ -291,7 +269,6 @@ async def handle_client(websocket) -> None:
                     try:
                         answer = await participant.peer_connection.createAnswer()
                         await participant.peer_connection.setLocalDescription(answer)
-                        # Отправляем answer (кандидаты будут отправлены отдельно через icecandidate)
                         await websocket.send(json.dumps({
                             "type": "answer",
                             "sdp": participant.peer_connection.localDescription.sdp,
@@ -299,6 +276,8 @@ async def handle_client(websocket) -> None:
                     except Exception as e:
                         logger.error(f"Failed to create/send answer: {e}", exc_info=True)
                         await participant.notify_renegotiation_needed()
+                    finally:
+                        participant._renegotiation_pending = False
 
             elif msg_type == "answer":
                 if not participant:
@@ -307,6 +286,7 @@ async def handle_client(websocket) -> None:
 
                 answer = RTCSessionDescription(sdp=data["sdp"], type="answer")
                 await participant.peer_connection.setRemoteDescription(answer)
+                participant._renegotiation_pending = False
 
             elif msg_type == "ice-candidate":
                 if not participant:
@@ -326,8 +306,7 @@ async def handle_client(websocket) -> None:
                 break
 
             else:
-                await websocket.send(
-                    json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
+                await websocket.send(json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
 
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"WebSocket closed for {participant_id}")
@@ -351,7 +330,7 @@ async def main() -> None:
         ssl_context = None
         proto = "ws"
 
-    async with websockets.serve(handle_client, "0.0.0.0", 8001, ssl=ssl_context, max_size=10 ** 7):
+    async with websockets.serve(handle_client, "0.0.0.0", 8001, ssl=ssl_context, max_size=10**7):
         logger.info(f"SFU server started on {proto}://0.0.0.0:8001")
         await asyncio.Future()
 
