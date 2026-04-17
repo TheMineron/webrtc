@@ -5,7 +5,6 @@ const roomIdInput = document.getElementById('roomId');
 const joinBtn = document.getElementById('joinBtn');
 const localVideo = document.getElementById('localVideo');
 const remoteVideosDiv = document.getElementById('remoteVideos');
-const startLatencyTestBtn = document.getElementById('startLatencyTest');
 const latencyResultDiv = document.getElementById('latencyResult');
 const webrtcStatsDiv = document.getElementById('webrtcStats');
 
@@ -14,18 +13,32 @@ let localStream = null;
 let currentRoomId = null;
 let currentNickname = null;
 let currentParticipantId = null;
+let conferenceStartTime = null;
 
 const peers = new Map();
 const prevStatsMap = new Map();
 
 let callStartTime = null;
 let firstVideoFrameTime = null;
+
 let e2eTestInProgress = false;
 let e2eStartTime = null;
-let e2eExpectedColor = null;
-let e2eRemoteCallback = null;
+let e2eRemoteMonitor = false;
+let e2eMonitorInterval = null;
 
-let lipSyncResults = [];
+let collectStatsInterval = null;
+let e2eTestInterval = null;
+let dataChannelPingInterval = null;
+
+let statsHistory = {
+    bitrate: [],
+    jitter: [],
+    rttIce: [],
+    rttDataChannel: [],
+    lipSync: []
+};
+
+let lastDataChannelRtt = null;
 
 const pcConfig = {
     iceServers: [
@@ -45,7 +58,7 @@ const pcConfig = {
 
 let canvasOverlay = null;
 
-function startColorFlash(color, duration = 500) {
+function startColorFlash(color, duration = 300) {
     if (!localVideo.srcObject) return;
     if (!canvasOverlay) {
         canvasOverlay = document.createElement('canvas');
@@ -104,11 +117,18 @@ function connectWebSocket(roomId, nickname) {
         }
         videoGrid.style.display = 'none';
         joinScreen.style.display = 'block';
-        // Сброс метрик
         callStartTime = null;
         firstVideoFrameTime = null;
+        conferenceStartTime = null;
         latencyResultDiv.innerHTML = '';
         webrtcStatsDiv.innerHTML = '';
+        if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
+        e2eTestInProgress = false;
+        e2eRemoteMonitor = false;
+        if (collectStatsInterval) clearInterval(collectStatsInterval);
+        if (e2eTestInterval) clearInterval(e2eTestInterval);
+        if (dataChannelPingInterval) clearInterval(dataChannelPingInterval);
+        statsHistory = { bitrate: [], jitter: [], rttIce: [], rttDataChannel: [], lipSync: [] };
     };
 }
 
@@ -138,7 +158,9 @@ async function handleSignalingMessage(msg) {
             console.log(`[JOIN] Успех: комната ${currentRoomId}, id=${currentParticipantId}`);
             joinScreen.style.display = 'none';
             videoGrid.style.display = 'flex';
+            conferenceStartTime = Date.now();
             await initLocalMedia();
+            startPeriodicTasks();
             break;
 
         case 'existing_participants':
@@ -166,25 +188,24 @@ async function handleSignalingMessage(msg) {
             latencyResultDiv.innerHTML = `<p>⏱️ RTT через WebSocket: ${rtt} мс</p>`;
             break;
 
-        case 'e2e_start':
+        case 'e2e_test_start':
             if (msg.from_id !== currentParticipantId) {
                 startE2eReceiver(msg.from_id);
             }
             break;
         case 'e2e_color_change':
-            if (msg.from_id !== currentParticipantId && e2eTestInProgress) {
-                const receivedTime = Date.now();
-                const sendTime = msg.timestamp;
-                const delay = receivedTime - sendTime;
-                latencyResultDiv.innerHTML += `<p>🎬 End-to-end задержка видео: ${delay} мс (приблизительно)</p>`;
-                e2eTestInProgress = false;
-                if (e2eRemoteCallback) e2eRemoteCallback(delay);
+            if (msg.from_id !== currentParticipantId && e2eRemoteMonitor) {
+                e2eStartTime = msg.timestamp;
+                console.log(`[E2E] Ожидаем цвет ${msg.color}, отправлено в ${e2eStartTime}`);
             }
             break;
         case 'e2e_result':
-            if (msg.from_id !== currentParticipantId && e2eRemoteCallback) {
-                e2eRemoteCallback(msg.delay);
-                e2eRemoteCallback = null;
+            if (msg.from_id !== currentParticipantId && e2eTestInProgress) {
+                const delay = msg.delay;
+                latencyResultDiv.innerHTML += `<p>🎬 End-to-end задержка видео: ${delay} мс</p>`;
+                e2eTestInProgress = false;
+                if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
+                e2eRemoteMonitor = false;
             }
             break;
 
@@ -259,7 +280,6 @@ async function createPeerConnection(remoteId, isInitiator) {
         if (peerInfo.videoElement.srcObject !== event.streams[0]) {
             peerInfo.videoElement.srcObject = event.streams[0];
             peerInfo.stream = event.streams[0];
-
             if (firstVideoFrameTime === null && callStartTime !== null) {
                 firstVideoFrameTime = performance.now();
                 const setupTime = firstVideoFrameTime - callStartTime;
@@ -292,12 +312,12 @@ function setupDataChannel(dc, remoteId) {
     dc.onmessage = (event) => {
         const data = JSON.parse(event.data);
         if (data.type === 'e2e_ping') {
-            // Ответ на end-to-end тест (через data channel)
-            dc.send(JSON.stringify({ type: 'e2e_pong', sendTime: data.sendTime, recvTime: Date.now() }));
+            dc.send(JSON.stringify({ type: 'e2e_pong', sendTime: data.sendTime }));
         } else if (data.type === 'e2e_pong') {
-            const now = Date.now();
-            const rtt = now - data.sendTime;
-            latencyResultDiv.innerHTML += `<p>📡 Задержка data channel (RTT): ${rtt} мс</p>`;
+            const rtt = Date.now() - data.sendTime;
+            statsHistory.rttDataChannel.push(rtt);
+            if (statsHistory.rttDataChannel.length > 50) statsHistory.rttDataChannel.shift();
+            lastDataChannelRtt = rtt;
         }
     };
 }
@@ -387,49 +407,80 @@ async function initLocalMedia() {
     }
 }
 
+function startPeriodicTasks() {
+    if (collectStatsInterval) clearInterval(collectStatsInterval);
+    if (e2eTestInterval) clearInterval(e2eTestInterval);
+    if (dataChannelPingInterval) clearInterval(dataChannelPingInterval);
+
+    collectStatsInterval = setInterval(() => {
+        if (videoGrid.style.display !== 'none') collectStats();
+    }, 3000);
+
+    e2eTestInterval = setInterval(() => {
+        if (peers.size > 0 && !e2eTestInProgress && conferenceStartTime) {
+            startE2eVideoLatencyTest();
+        }
+    }, 30000);
+
+    dataChannelPingInterval = setInterval(() => {
+        if (peers.size > 0) {
+            for (const [remoteId, peerInfo] of peers.entries()) {
+                if (peerInfo.dataChannel && peerInfo.dataChannel.readyState === 'open') {
+                    const sendTime = Date.now();
+                    peerInfo.dataChannel.send(JSON.stringify({ type: 'e2e_ping', sendTime }));
+                    break;
+                }
+            }
+        }
+    }, 3000);
+}
+
 function startE2eVideoLatencyTest() {
-    if (peers.size === 0) {
-        alert('Нет удалённых участников для теста');
-        return;
-    }
+    if (peers.size === 0) return;
     if (e2eTestInProgress) return;
     e2eTestInProgress = true;
 
     const remoteId = peers.keys().next().value;
-
-    sendSignal(remoteId, { type: 'e2e_start' });
+    sendSignal(remoteId, { type: 'e2e_test_start' });
 
     setTimeout(() => {
-        if (!localStream) return;
+        if (!localStream) {
+            e2eTestInProgress = false;
+            return;
+        }
         e2eStartTime = Date.now();
-
         const colors = ['red', 'lime', 'blue', 'yellow', 'magenta'];
-        e2eExpectedColor = colors[Math.floor(Math.random() * colors.length)];
-        startColorFlash(e2eExpectedColor, 300);
+        const color = colors[Math.floor(Math.random() * colors.length)];
+        startColorFlash(color, 300);
         sendSignal(remoteId, {
             type: 'e2e_color_change',
             timestamp: e2eStartTime,
-            color: e2eExpectedColor
+            color: color
         });
 
         setTimeout(() => {
             if (e2eTestInProgress) {
                 latencyResultDiv.innerHTML += '<p>⚠️ Тест E2E не завершился (таймаут)</p>';
                 e2eTestInProgress = false;
+                if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
             }
         }, 5000);
     }, 500);
 }
 
 function startE2eReceiver(senderId) {
-    console.log('[E2E] Начинаем мониторинг видео для end-to-end теста');
+    if (e2eRemoteMonitor) return;
+    e2eRemoteMonitor = true;
     const peerInfo = peers.get(senderId);
-    if (!peerInfo || !peerInfo.videoElement) return;
+    if (!peerInfo || !peerInfo.videoElement) {
+        e2eRemoteMonitor = false;
+        return;
+    }
 
     let lastColor = null;
-    const interval = setInterval(() => {
-        if (!e2eTestInProgress) {
-            clearInterval(interval);
+    e2eMonitorInterval = setInterval(() => {
+        if (!e2eRemoteMonitor) {
+            clearInterval(e2eMonitorInterval);
             return;
         }
         const video = peerInfo.videoElement;
@@ -449,13 +500,13 @@ function startE2eReceiver(senderId) {
         else if (b > 200 && r < 100 && g < 100) dominant = 'blue';
         else if (r > 200 && g > 200 && b < 100) dominant = 'yellow';
         else if (r > 200 && g < 100 && b > 200) dominant = 'magenta';
-        if (dominant && dominant !== lastColor) {
+        if (dominant && dominant !== lastColor && e2eStartTime) {
             lastColor = dominant;
             const detectTime = Date.now();
-
-            sendSignal(senderId, { type: 'e2e_result', delay: detectTime - e2eStartTime });
-            clearInterval(interval);
-            e2eTestInProgress = false;
+            const delay = detectTime - e2eStartTime;
+            sendSignal(senderId, { type: 'e2e_result', delay: delay });
+            e2eRemoteMonitor = false;
+            clearInterval(e2eMonitorInterval);
         }
     }, 50);
 }
@@ -463,6 +514,8 @@ function startE2eReceiver(senderId) {
 async function collectStats() {
     let statsText = '';
     const now = Date.now();
+    let currentBitrate = 0, currentJitter = 0, currentRttIce = 0, currentLipSync = 0;
+    let hasData = false;
 
     for (const [remoteId, peerInfo] of peers.entries()) {
         const pc = peerInfo.pc;
@@ -480,80 +533,78 @@ async function collectStats() {
         if (inboundVideo) {
             const currentBytes = inboundVideo.bytesReceived;
             const prev = prevStatsMap.get(remoteId);
-            let bitrateKbps = 0;
             if (prev && prev.bytes !== undefined && prev.timestamp) {
                 const bytesDiff = currentBytes - prev.bytes;
                 const timeDiffSec = (now - prev.timestamp) / 1000;
                 if (timeDiffSec > 0 && bytesDiff >= 0) {
-                    bitrateKbps = (bytesDiff * 8) / timeDiffSec / 1000;
+                    currentBitrate = (bytesDiff * 8) / timeDiffSec / 1000;
+                    statsHistory.bitrate.push(currentBitrate);
+                    if (statsHistory.bitrate.length > 50) statsHistory.bitrate.shift();
                 }
             }
             prevStatsMap.set(remoteId, { bytes: currentBytes, timestamp: now });
 
+            currentJitter = (inboundVideo.jitter * 1000);
+            statsHistory.jitter.push(currentJitter);
+            if (statsHistory.jitter.length > 50) statsHistory.jitter.shift();
+
             statsText += `Участник ${remoteId.slice(0,6)}:\n`;
-            statsText += `  Битрейт видео: ${bitrateKbps.toFixed(2)} kbps\n`;
+            statsText += `  Битрейт видео: ${currentBitrate.toFixed(2)} kbps\n`;
             statsText += `  Потеря пакетов: ${inboundVideo.packetsLost}\n`;
-            statsText += `  Джиттер: ${(inboundVideo.jitter * 1000).toFixed(2)} мс\n`;
+            statsText += `  Джиттер: ${currentJitter.toFixed(2)} мс\n`;
+            hasData = true;
         } else {
             statsText += `Участник ${remoteId.slice(0,6)}: нет видео-потока\n`;
         }
 
         if (candidatePair) {
-            statsText += `  RTT (ICE): ${(candidatePair.currentRoundTripTime * 1000).toFixed(2)} мс\n`;
+            currentRttIce = candidatePair.currentRoundTripTime * 1000;
+            statsHistory.rttIce.push(currentRttIce);
+            if (statsHistory.rttIce.length > 50) statsHistory.rttIce.shift();
+            statsText += `  RTT (ICE): ${currentRttIce.toFixed(2)} мс\n`;
         }
 
-        // Анализ синхронизации аудио/видео (lip sync)
-        if (inboundVideo && inboundAudio && inboundVideo.timestamp && inboundAudio.timestamp) {
-            const videoTime = inboundVideo.timestamp / 1000;   // seconds
-            const audioTime = inboundAudio.timestamp / 1000;
-            const diff = Math.abs(videoTime - audioTime) * 1000; // ms
-            if (diff < 500) { // игнорируем выбросы
-                lipSyncResults.push(diff);
-                if (lipSyncResults.length > 10) lipSyncResults.shift();
-                const avgLipSync = lipSyncResults.reduce((a,b) => a+b,0) / lipSyncResults.length;
-                statsText += `  Расхождение аудио/видео (приблиз.): ${avgLipSync.toFixed(2)} мс\n`;
+        if (inboundVideo && inboundAudio && inboundVideo.mediaTime !== undefined && inboundAudio.mediaTime !== undefined) {
+            const videoTime = inboundVideo.mediaTime;
+            const audioTime = inboundAudio.mediaTime;
+            const diff = Math.abs(videoTime - audioTime) * 1000;
+            if (diff < 500) {
+                currentLipSync = diff;
+                statsHistory.lipSync.push(currentLipSync);
+                if (statsHistory.lipSync.length > 50) statsHistory.lipSync.shift();
+                statsText += `  Расхождение аудио/видео: ${currentLipSync.toFixed(2)} мс\n`;
             }
         }
         statsText += '\n';
     }
 
-    if (statsText === '') statsText = 'Нет активных соединений';
+    if (!hasData) {
+        statsText = 'Нет активных соединений\n';
+    }
+
+    const avgBitrate = statsHistory.bitrate.length ? (statsHistory.bitrate.reduce((a,b)=>a+b,0)/statsHistory.bitrate.length).toFixed(2) : '—';
+    const avgJitter = statsHistory.jitter.length ? (statsHistory.jitter.reduce((a,b)=>a+b,0)/statsHistory.jitter.length).toFixed(2) : '—';
+    const avgRttIce = statsHistory.rttIce.length ? (statsHistory.rttIce.reduce((a,b)=>a+b,0)/statsHistory.rttIce.length).toFixed(2) : '—';
+    const avgRttData = statsHistory.rttDataChannel.length ? (statsHistory.rttDataChannel.reduce((a,b)=>a+b,0)/statsHistory.rttDataChannel.length).toFixed(2) : '—';
+    const avgLipSync = statsHistory.lipSync.length ? (statsHistory.lipSync.reduce((a,b)=>a+b,0)/statsHistory.lipSync.length).toFixed(2) : '—';
+
+    let conferenceDuration = '—';
+    if (conferenceStartTime) {
+        const durationSec = (Date.now() - conferenceStartTime) / 1000;
+        const minutes = Math.floor(durationSec / 60);
+        const seconds = Math.floor(durationSec % 60);
+        conferenceDuration = `${minutes}м ${seconds}с`;
+    }
+
+    statsText += `\n--- СРЕДНИЕ ЗА ВРЕМЯ КОНФЕРЕНЦИИ (${conferenceDuration}) ---\n`;
+    statsText += `Средний битрейт: ${avgBitrate} kbps\n`;
+    statsText += `Средний джиттер: ${avgJitter} мс\n`;
+    statsText += `Средний RTT ICE: ${avgRttIce} мс\n`;
+    statsText += `Средний RTT DataChannel: ${avgRttData} мс\n`;
+    statsText += `Среднее расхождение аудио/видео: ${avgLipSync} мс\n`;
+
     webrtcStatsDiv.innerHTML = `<pre>${statsText}</pre>`;
 }
-
-startLatencyTestBtn.addEventListener('click', () => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        if (peers.size > 0) {
-            const firstPeer = peers.values().next().value;
-            if (firstPeer.dataChannel && firstPeer.dataChannel.readyState === 'open') {
-                const sendTime = Date.now();
-                firstPeer.dataChannel.send(JSON.stringify({ type: 'e2e_ping', sendTime }));
-                latencyResultDiv.innerHTML = '<p>Измерение через DataChannel...</p>';
-                // Ждём ответа в setupDataChannel
-            } else {
-                sendPing(); // fallback на WebSocket ping
-            }
-        } else {
-            sendPing();
-        }
-    } else {
-        alert('WebSocket не подключён');
-    }
-});
-
-
-if (!document.getElementById('e2eVideoTestBtn')) {
-    const e2eBtn = document.createElement('button');
-    e2eBtn.id = 'e2eVideoTestBtn';
-    e2eBtn.textContent = 'Замерить E2E задержку видео (мигание)';
-    e2eBtn.style.marginLeft = '10px';
-    startLatencyTestBtn.parentNode.insertBefore(e2eBtn, startLatencyTestBtn.nextSibling);
-    e2eBtn.addEventListener('click', startE2eVideoLatencyTest);
-}
-
-setInterval(() => {
-    if (videoGrid.style.display !== 'none') collectStats();
-}, 5000);
 
 joinBtn.addEventListener('click', () => {
     const nickname = nicknameInput.value.trim();
