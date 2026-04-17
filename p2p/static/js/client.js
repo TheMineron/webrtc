@@ -44,6 +44,9 @@ let statsHistory = {
 
 let lastDataChannelRtt = null;
 
+// ---- ДОПОЛНИТЕЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ ИСПРАВЛЕНИЙ ----
+let pendingExistingParticipants = []; // список участников, ждущих localStream
+
 const pcConfig = {
     iceServers: [
         {urls: 'stun:stun.l.google.com:19302'},
@@ -59,6 +62,7 @@ const pcConfig = {
     ],
     iceCandidatePoolSize: 10
 };
+
 async function flashColorOnStream(color, duration = 300) {
     if (!localStream) return;
 
@@ -143,6 +147,7 @@ function connectWebSocket(roomId, nickname) {
         if (dataChannelPingInterval) clearInterval(dataChannelPingInterval);
         if (websocketPingInterval) clearInterval(websocketPingInterval);
         statsHistory = {bitrate: [], jitter: [], rttIce: [], rttDataChannel: [], rttWebsocket: [], lipSync: []};
+        pendingExistingParticipants = [];
     };
 }
 
@@ -175,15 +180,32 @@ async function handleSignalingMessage(msg) {
             conferenceStartTime = Date.now();
             await initLocalMedia();
             startPeriodicTasks();
+            // После инициализации localStream создаём соединения с участниками, которые уже были в комнате
+            for (const participant of pendingExistingParticipants) {
+                await createPeerConnection(participant.id, true);
+            }
+            pendingExistingParticipants = [];
             break;
 
         case 'existing_participants':
-            console.log('[EXISTING] Участники в комнате (ждём offer от них):', msg.participants);
+            console.log('[EXISTING] Участники в комнате (создадим соединения после готовности локального потока):', msg.participants);
+            // Сохраняем участников до момента, когда localStream будет готов
+            pendingExistingParticipants = msg.participants.filter(p => p.id !== currentParticipantId);
+            // Если localStream уже готов (маловероятно, но на всякий случай), создаём сразу
+            if (localStream) {
+                for (const participant of pendingExistingParticipants) {
+                    await createPeerConnection(participant.id, true);
+                }
+                pendingExistingParticipants = [];
+            }
             break;
 
         case 'participant_joined':
-            console.log('[NEW] Новый участник, создаём активное соединение:', msg.participant);
-            await createPeerConnection(msg.participant.id, true);
+            console.log('[NEW] Новый участник, создаём соединение (как отвечающая сторона):', msg.participant);
+            // Только если это не мы сами (сервер обычно не присылает нам самих)
+            if (msg.participant.id !== currentParticipantId && !peers.has(msg.participant.id)) {
+                await createPeerConnection(msg.participant.id, false); // isInitiator = false
+            }
             break;
 
         case 'participant_left':
@@ -193,24 +215,8 @@ async function handleSignalingMessage(msg) {
 
         case 'signal':
             const signal = msg.data;
-            if (signal.type === 'e2e_test_start') {
-                startE2eReceiver(msg.from_id);
-            } else if (signal.type === 'e2e_color_change') {
-                if (msg.from_id !== currentParticipantId && e2eRemoteMonitor) {
-                    e2eStartTime = signal.timestamp;
-                    console.log(`[E2E] Ожидаем цвет ${signal.color}, отправлено в ${e2eStartTime}`);
-                }
-            } else if (signal.type === 'e2e_result') {
-                if (msg.from_id !== currentParticipantId && e2eTestInProgress) {
-                    const delay = signal.delay;
-                    latencyResultDiv.innerHTML += `<p>🎬 End-to-end задержка видео: ${delay} мс</p>`;
-                    e2eTestInProgress = false;
-                    if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
-                    e2eRemoteMonitor = false;
-                }
-            } else {
-                await handleSignal(msg.from_id, signal);
-            }
+            // Удаляем дублирование e2e тестов внутри signal, они обрабатываются отдельными case
+            await handleSignal(msg.from_id, signal);
             break;
 
         case 'pong': {
@@ -301,6 +307,8 @@ async function createPeerConnection(remoteId, isInitiator) {
         localStream.getTracks().forEach(track => {
             pc.addTrack(track, localStream);
         });
+    } else {
+        console.warn(`[PC] localStream ещё не готов, треки будут добавлены позже для ${remoteId}`);
     }
 
     pc.onicecandidate = (event) => {
@@ -331,6 +339,15 @@ async function createPeerConnection(remoteId, isInitiator) {
 
     if (isInitiator) {
         try {
+            // Если localStream ещё нет, откладываем создание offer до его появления
+            if (!localStream) {
+                console.log(`[PC] localStream отсутствует, offer для ${remoteId} будет создан позже`);
+                // Можно сохранить флаг, но проще дождаться и перевызвать offer позже
+                // В нашем коде localStream появляется до вызова createPeerConnection для isInitiator,
+                // потому что мы вызываем createPeerConnection после initLocalMedia.
+                // Оставляем как защиту.
+                return;
+            }
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             sendSignal(remoteId, {type: 'offer', sdp: offer.sdp});
@@ -425,11 +442,17 @@ async function initLocalMedia() {
     try {
         localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
         localVideo.srcObject = localStream;
+        // Добавляем локальные треки во все уже существующие PeerConnection
         for (const [remoteId, peerInfo] of peers.entries()) {
             localStream.getTracks().forEach(track => {
                 peerInfo.pc.addTrack(track, localStream);
             });
-            if (peerInfo.pc.signalingState === 'stable' && peerInfo.pc.remoteDescription) {
+            // Если соединение уже в stable и есть remoteDescription, нужно пересоздать offer?
+            // Обычно достаточно добавить треки, они сами отправятся.
+            // Но если мы уже получили offer, то нужно переслать новый offer с добавленными треками.
+            // Для простоты, если pc не в состоянии "have-local-offer", можно ничего не делать.
+            // Однако для надёжности, если это инициатор и localDescription не установлен, создадим offer.
+            if (peerInfo.pc.signalingState === 'stable' && !peerInfo.pc.localDescription) {
                 const offer = await peerInfo.pc.createOffer();
                 await peerInfo.pc.setLocalDescription(offer);
                 sendSignal(remoteId, {type: 'offer', sdp: offer.sdp});
@@ -645,7 +668,6 @@ async function collectStats() {
     statsText += `Средний RTT WebSocket: ${avgRttWebsocket} мс\n`;
     statsText += `Средний RTT DataChannel: ${avgRttData} мс\n`;
     statsText += `Среднее расхождение аудио/видео: ${avgLipSync} мс\n`;
-
 
     webrtcStatsDiv.innerHTML = `<pre>${statsText}</pre>`;
 }
