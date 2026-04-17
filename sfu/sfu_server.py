@@ -139,14 +139,51 @@ class Participant:
             logger.warning(f"Track {track.kind} already exists, skipping")
             return
 
-        # Новый трек – используем addTrack (работает только в stable)
-        logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
-        sender = self.peer_connection.addTrack(track)
-        if sender is None:
-            logger.error(f"addTrack returned None for {track.kind}")
+        # Новый трек – создаём transceiver с направлением sendonly
+        logger.info(f"Adding new {track.kind} transceiver for {sender_id}")
+        transceiver = self.peer_connection.addTransceiver(track.kind, direction='sendonly')
+        if transceiver is None or transceiver.sender is None:
+            logger.error(f"Failed to create transceiver for {track.kind}")
             return
+        sender = transceiver.sender
+        await sender.replaceTrack(track)
         senders[track.kind] = sender
-        await self.notify_renegotiation_needed()
+        await self.send_offer()  # отправляем offer клиенту
+
+    async def send_offer(self) -> None:
+        """Создаёт и отправляет offer клиенту, инициируя renegotiation."""
+        if self.peer_connection.signalingState != "stable":
+            logger.warning(f"Cannot send offer, state is {self.peer_connection.signalingState}")
+            return
+        try:
+            offer = await self.peer_connection.createOffer()
+            await self.peer_connection.setLocalDescription(offer)
+            await self.websocket.send(json.dumps({
+                "type": "offer",
+                "sdp": self.peer_connection.localDescription.sdp
+            }))
+            logger.info(f"Sent offer to {self.id}")
+        except Exception as e:
+            logger.error(f"Failed to send offer to {self.id}: {e}")
+
+    async def close(self) -> None:
+        logger.info(f"Closing participant {self.id}, remote_senders: {self.remote_senders}")
+        for pid, participant in self.room.participants.items():
+            if pid != self.id and self.id in participant.remote_senders:
+                for kind, sender in participant.remote_senders[self.id].items():
+                    try:
+                        if sender is not None:
+                            # replaceTrack может быть не асинхронным, но обернём
+                            result = sender.replaceTrack(None)
+                            if result is not None and hasattr(result, "__await__"):
+                                await result
+                    except Exception as e:
+                        logger.warning(f"Failed to stop track {kind} sender: {e}")
+                del participant.remote_senders[self.id]
+                await participant.send_offer()  # уведомляем других участников об удалении треков
+
+        self.room.remove_participant(self.id)
+        await self.peer_connection.close()
 
     async def notify_renegotiation_needed(self) -> None:
         if self._renegotiation_pending:
@@ -158,26 +195,6 @@ class Participant:
         except Exception as e:
             logger.error(f"Failed to send renegotiate notification: {e}")
 
-    async def close(self) -> None:
-        logger.info(f"Closing participant {self.id}, remote_senders: {self.remote_senders}")
-        # Удаляем все senders, принадлежащие этому участнику, из соединений других участников
-        for pid, participant in self.room.participants.items():
-            if pid != self.id and self.id in participant.remote_senders:
-                for kind, sender in participant.remote_senders[self.id].items():
-                    try:
-                        # Останавливаем sender, заменяя трек на None (без await – replaceTrack может быть не асинхронным?)
-                        if sender is not None:
-                            # В aiortc replaceTrack не асинхронный, но мы обернём в await на всякий случай
-                            result = sender.replaceTrack(None)
-                            if result is not None and hasattr(result, "__await__"):
-                                await result
-                    except Exception as e:
-                        logger.warning(f"Failed to stop track {kind} sender: {e}")
-                del participant.remote_senders[self.id]
-                await participant.notify_renegotiation_needed()
-
-        self.room.remove_participant(self.id)
-        await self.peer_connection.close()
 
     def __str__(self) -> str:
         return f"{self.id}"
