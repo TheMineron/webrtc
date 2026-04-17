@@ -32,6 +32,7 @@ let e2eRemoteMonitor = false;
 let e2eMonitorInterval = null;
 let originalVideoTrack = null;
 let canvasStream = null;
+let lastE2eResult = null;        // для отображения в статистике
 
 // --- Метрики и статистика ---
 let conferenceStartTime = null;
@@ -49,7 +50,8 @@ let statsHistory = {
   jitter: [],
   rttIce: [],
   lipSync: [],
-  rttWebsocket: []
+  rttWebsocket: [],
+  e2eDelay: []                // массив для хранения результатов E2E
 };
 
 let statsInterval = null;
@@ -112,7 +114,6 @@ async function flashColorOnStream(color, duration = 300) {
   localStream.removeTrack(videoTrack);
   localStream.addTrack(colorTrack);
 
-  // Заменяем трек в PeerConnection
   const senders = sfuPeerConnection.getSenders();
   const videoSender = senders.find(s => s.track?.kind === 'video');
   if (videoSender) await videoSender.replaceTrack(colorTrack);
@@ -134,38 +135,38 @@ function sendSignal(targetId, data) {
       target_id: targetId,
       data: data
     }));
+    console.log(`[E2E] Сигнал отправлен ${targetId}:`, data.type);
+  } else {
+    console.warn('[E2E] Signaling socket не готов');
   }
 }
 
 // --- Запуск E2E теста (отправитель) ---
 function startE2eVideoLatencyTest() {
-  if (e2eTestInProgress) return;
-  // Находим первого удалённого участника (любого)
-  const remoteParticipants = Object.keys(remoteVideoElements);
-  if (remoteParticipants.length === 0) return;
-  // Получаем ID участника из потока remote-видео (он хранится в метке)
-  // В SFU нет прямого списка ID, поэтому проще: берём первый удалённый поток и из его ID извлекаем participantId
-  // Но у нас нет маппинга. Вместо этого будем хранить participantId для каждого remote video.
-  // Для простоты: при получении ontrack мы можем сохранить связь stream.id -> participantId.
-  // Однако в текущей реализации мы не знаем participantId отправителя. Можно добавить в метаданные.
-  // Альтернатива: выбрать первого участника из списка комнаты, который нам прислал signaling при join.
-  // Временно: отправим сигнал всем, или используем первого попавшегося.
-  // Для демонстрации: отправляем сигнал на самого себя? Нет.
-  // Лучше: при получении `existing_participants` сохраним список ID. Добавим переменную.
-  if (!window.remoteParticipantIds || window.remoteParticipantIds.length === 0) return;
+  if (e2eTestInProgress) {
+    console.log('[E2E] Тест уже идёт, пропускаем');
+    return;
+  }
+  if (!window.remoteParticipantIds || window.remoteParticipantIds.length === 0) {
+    console.log('[E2E] Нет удалённых участников');
+    return;
+  }
   const targetId = window.remoteParticipantIds[0];
+  console.log(`[E2E] Запуск теста для участника ${targetId}`);
   e2eTestInProgress = true;
 
   sendSignal(targetId, { type: 'e2e_test_start' });
 
   setTimeout(async () => {
     if (!localStream) {
+      console.warn('[E2E] Нет локального потока');
       e2eTestInProgress = false;
       return;
     }
     e2eStartTime = Date.now();
     const colors = ['red', 'lime', 'blue', 'yellow', 'magenta'];
     const color = colors[Math.floor(Math.random() * colors.length)];
+    console.log(`[E2E] Отправляем цвет ${color} в ${e2eStartTime}`);
     await flashColorOnStream(color, 300);
     sendSignal(targetId, {
       type: 'e2e_color_change',
@@ -175,6 +176,7 @@ function startE2eVideoLatencyTest() {
 
     setTimeout(() => {
       if (e2eTestInProgress) {
+        console.warn('[E2E] Таймаут теста (10 секунд)');
         latencyResultDiv.innerHTML += '<p>⚠️ Тест E2E не завершился (таймаут)</p>';
         e2eTestInProgress = false;
         if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
@@ -185,11 +187,16 @@ function startE2eVideoLatencyTest() {
 
 // --- Приёмник E2E теста ---
 function startE2eReceiver(senderId) {
-  if (e2eRemoteMonitor) return;
+  if (e2eRemoteMonitor) {
+    console.log('[E2E] Уже в режиме мониторинга');
+    return;
+  }
+  console.log(`[E2E] Запуск приёмника для отправителя ${senderId}`);
   e2eRemoteMonitor = true;
-  // Находим видеоэлемент, соответствующий senderId
-  const videoElement = remoteVideoElements.get(senderId);
+  // Получаем видеоэлемент по ID отправителя
+  const videoElement = window.remoteVideoByParticipant?.get(senderId);
   if (!videoElement) {
+    console.warn(`[E2E] Не найден видеоэлемент для отправителя ${senderId}`);
     e2eRemoteMonitor = false;
     return;
   }
@@ -201,7 +208,10 @@ function startE2eReceiver(senderId) {
       return;
     }
     const video = videoElement;
-    if (!video.videoWidth || !video.videoHeight) return;
+    if (!video.videoWidth || !video.videoHeight) {
+      // console.log('[E2E] Видео ещё не имеет размера');
+      return;
+    }
     const canvas = document.createElement('canvas');
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
@@ -221,7 +231,12 @@ function startE2eReceiver(senderId) {
       lastColor = dominant;
       const detectTime = Date.now();
       const delay = detectTime - e2eStartTime;
+      console.log(`[E2E] Обнаружен цвет ${dominant}, задержка = ${delay} мс`);
       sendSignal(senderId, { type: 'e2e_result', delay: delay });
+      // Сохраняем результат для отображения в статистике
+      lastE2eResult = delay;
+      statsHistory.e2eDelay.push(delay);
+      if (statsHistory.e2eDelay.length > 10) statsHistory.e2eDelay.shift();
       latencyResultDiv.innerHTML += `<p>🎬 End-to-end задержка видео: ${delay} мс</p>`;
       e2eRemoteMonitor = false;
       clearInterval(e2eMonitorInterval);
@@ -229,7 +244,7 @@ function startE2eReceiver(senderId) {
   }, 50);
 }
 
-// --- WebSocket ping для измерения RTT ---
+// --- WebSocket ping ---
 function sendPing() {
   if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
     const timestamp = Date.now();
@@ -243,7 +258,7 @@ function sendPing() {
   }
 }
 
-// --- Сбор статистики (полностью как ранее, но добавлен вывод E2E) ---
+// --- Сбор статистики (добавлен вывод E2E) ---
 async function collectFullStats() {
   if (!sfuPeerConnection) {
     localStatsContent.innerText = '— нет соединения —';
@@ -401,6 +416,11 @@ async function collectFullStats() {
       remoteText += `📞 Время установления соединения: ${setupTime} мс\n`;
     }
 
+    // --- Вывод последней E2E задержки ---
+    if (lastE2eResult !== null) {
+      remoteText += `🎬 End-to-end задержка видео: ${lastE2eResult} мс (последний тест)\n`;
+    }
+
     let durationText = '—';
     if (conferenceStartTime) {
       const sec = (Date.now() - conferenceStartTime) / 1000;
@@ -423,6 +443,8 @@ async function collectFullStats() {
         (statsHistory.lipSync.reduce((a,b)=>a+b,0)/statsHistory.lipSync.length).toFixed(2) : '—';
     const avgRttWs = statsHistory.rttWebsocket.length ?
         (statsHistory.rttWebsocket.reduce((a,b)=>a+b,0)/statsHistory.rttWebsocket.length).toFixed(2) : '—';
+    const avgE2e = statsHistory.e2eDelay.length ?
+        (statsHistory.e2eDelay.reduce((a,b)=>a+b,0)/statsHistory.e2eDelay.length).toFixed(2) : '—';
 
     remoteText += `\n📈 СРЕДНИЕ ЗА КОНФЕРЕНЦИЮ (${durationText}):\n`;
     remoteText += `   Исх. битрейт видео: ${avgOutVideo} kbps\n`;
@@ -432,6 +454,7 @@ async function collectFullStats() {
     remoteText += `   RTT ICE: ${avgRttIce} мс\n`;
     remoteText += `   RTT WebSocket: ${avgRttWs} мс\n`;
     remoteText += `   Расхождение A/V: ${avgLipSync} мс\n`;
+    remoteText += `   E2E задержка видео: ${avgE2e} мс\n`;
 
     remoteStatsContent.innerText = remoteText;
 
@@ -442,7 +465,7 @@ async function collectFullStats() {
   }
 }
 
-// --- Обработка сигнальных сообщений (расширена для signal и E2E) ---
+// --- Обработка сигнальных сообщений ---
 async function joinRoom() {
   roomId = roomInput.value.trim();
   nickname = nameInput.value.trim();
@@ -469,7 +492,7 @@ async function joinRoom() {
 
   signalingSocket.onmessage = async (event) => {
     const msg = JSON.parse(event.data);
-    console.log('Signaling message:', msg);
+    console.log('Signaling message:', msg.type, msg);
 
     switch (msg.type) {
       case 'joined':
@@ -481,8 +504,8 @@ async function joinRoom() {
         break;
 
       case 'existing_participants':
-        // Сохраняем список ID удалённых участников для E2E теста
         window.remoteParticipantIds = msg.participants.map(p => p.id);
+        console.log('[E2E] Список удалённых участников:', window.remoteParticipantIds);
         break;
 
       case 'participant_joined':
@@ -503,17 +526,23 @@ async function joinRoom() {
         break;
 
       case 'signal':
-        // Пересылка сигналов между участниками
+        console.log('[E2E] Получен signal от', msg.from_id, msg.data);
         if (msg.data.type === 'e2e_test_start') {
           startE2eReceiver(msg.from_id);
         } else if (msg.data.type === 'e2e_color_change') {
           if (e2eRemoteMonitor) {
             e2eStartTime = msg.data.timestamp;
             console.log(`[E2E] Ожидаем цвет ${msg.data.color}, отправлено в ${e2eStartTime}`);
+          } else {
+            console.log('[E2E] Игнорируем e2e_color_change, мониторинг не активен');
           }
         } else if (msg.data.type === 'e2e_result') {
           if (e2eTestInProgress) {
             const delay = msg.data.delay;
+            console.log(`[E2E] Получен результат задержки: ${delay} мс`);
+            lastE2eResult = delay;
+            statsHistory.e2eDelay.push(delay);
+            if (statsHistory.e2eDelay.length > 10) statsHistory.e2eDelay.shift();
             latencyResultDiv.innerHTML += `<p>🎬 End-to-end задержка видео: ${delay} мс</p>`;
             e2eTestInProgress = false;
             if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
@@ -696,7 +725,6 @@ async function setupSFUPeerConnection() {
     container.id = `video-${stream.id}`;
     const labelDiv = document.createElement('div');
     labelDiv.className = 'label';
-    // Пытаемся извлечь ID отправителя из stream.id (обычно SFU формирует "remote-<participantId>")
     let remoteId = stream.id.replace('remote-', '');
     if (remoteId === stream.id) remoteId = 'unknown';
     labelDiv.textContent = `Remote (${remoteId.slice(0, 8)})`;
@@ -704,9 +732,9 @@ async function setupSFUPeerConnection() {
     container.appendChild(labelDiv);
     videosContainer.appendChild(container);
     remoteVideoElements.set(stream.id, video);
-    // Сохраняем соответствие participantId -> video элемент для E2E
     if (!window.remoteVideoByParticipant) window.remoteVideoByParticipant = new Map();
     window.remoteVideoByParticipant.set(remoteId, video);
+    console.log(`[E2E] Зарегистрирован видеоэлемент для участника ${remoteId}`);
   };
 
   sfuPeerConnection.onconnectionstatechange = () => {
@@ -777,7 +805,7 @@ function cleanup() {
   if (window.remoteVideoByParticipant) window.remoteVideoByParticipant.clear();
   prevOutboundStats = { video: { bytes: 0, timestamp: 0, packets: 0 }, audio: { bytes: 0, timestamp: 0, packets: 0 } };
   prevInboundStats = { bytes: 0, timestamp: 0 };
-  statsHistory = { bitrateOutVideo: [], bitrateOutAudio: [], bitrateInVideo: [], jitter: [], rttIce: [], lipSync: [], rttWebsocket: [] };
+  statsHistory = { bitrateOutVideo: [], bitrateOutAudio: [], bitrateInVideo: [], jitter: [], rttIce: [], lipSync: [], rttWebsocket: [], e2eDelay: [] };
   conferenceStartTime = null;
   callStartTime = null;
   firstVideoFrameTime = null;
@@ -785,6 +813,7 @@ function cleanup() {
   e2eTestInProgress = false;
   e2eRemoteMonitor = false;
   e2eStartTime = null;
+  lastE2eResult = null;
   localStatsContent.innerText = '— соединение закрыто —';
   remoteStatsContent.innerText = '— соединение закрыто —';
   latencyResultDiv.innerHTML = '';
