@@ -115,11 +115,10 @@ class Participant:
                 for sender_id, track, replace_existing in pending:
                     await self.add_or_replace_track(sender_id, track, replace_existing)
 
-        # === НОВЫЙ ОБРАБОТЧИК ДЛЯ ОТПРАВКИ ICE-КАНДИДАТОВ КЛИЕНТУ ===
         @self.peer_connection.on("icecandidate")
         async def on_icecandidate(candidate):
             if candidate:
-                logger.info(f"Sending ICE candidate to {self.id}")
+                logger.info(f"Sending ICE candidate to {self.id}: {candidate.candidate[:50]}...")
                 try:
                     await self.websocket.send(json.dumps({
                         "type": "ice-candidate",
@@ -132,9 +131,10 @@ class Participant:
                     }))
                 except Exception as e:
                     logger.error(f"Failed to send ICE candidate to {self.id}: {e}")
+            else:
+                logger.info(f"ICE candidate gathering complete for {self.id}")
 
     async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
-        # Если состояние не stable, откладываем операцию
         if self.peer_connection.signalingState != "stable":
             logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
             self.pending_tracks.append((sender_id, track, replace_existing))
@@ -155,7 +155,6 @@ class Participant:
             logger.warning(f"Track {track.kind} already exists, skipping")
             return
 
-        # Новый трек – используем addTrack (работает только в stable)
         logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
         sender = self.peer_connection.addTrack(track)
         if sender is None:
@@ -176,12 +175,10 @@ class Participant:
 
     async def close(self) -> None:
         logger.info(f"Closing participant {self.id}, remote_senders: {self.remote_senders}")
-        # Удаляем все senders, принадлежащие этому участнику, из соединений других участников
         for pid, participant in self.room.participants.items():
             if pid != self.id and self.id in participant.remote_senders:
                 for kind, sender in participant.remote_senders[self.id].items():
                     try:
-                        # Останавливаем sender, заменяя трек на None
                         if sender is not None:
                             result = sender.replaceTrack(None)
                             if result is not None and hasattr(result, "__await__"):
@@ -280,7 +277,9 @@ async def handle_client(websocket) -> None:
                     await room.send_existing_tracks_to_newcomer(participant.id)
                     participant._tracks_initialized = True
 
-                if participant.peer_connection.signalingState == "have-remote-offer":
+                # Исправление: всегда создаём answer, если remoteDescription установлен
+                # и нет локального описания (то есть это ответ на renegotiation)
+                if not participant.peer_connection.localDescription:
                     try:
                         answer = await participant.peer_connection.createAnswer()
                         await participant.peer_connection.setLocalDescription(answer)
@@ -288,11 +287,14 @@ async def handle_client(websocket) -> None:
                             "type": "answer",
                             "sdp": participant.peer_connection.localDescription.sdp,
                         }))
+                        logger.info(f"Sent answer to {participant.id}")
                     except Exception as e:
                         logger.error(f"Failed to create/send answer: {e}", exc_info=True)
                         await participant.notify_renegotiation_needed()
                     finally:
                         participant._renegotiation_pending = False
+                else:
+                    logger.info(f"Local description already exists, skipping answer for {participant.id}")
 
             elif msg_type == "answer":
                 if not participant:
@@ -308,11 +310,9 @@ async def handle_client(websocket) -> None:
                     continue
 
                 candidate_data = data.get("candidate")
-                # Пропускаем пустые или невалидные кандидаты
                 if not candidate_data or not candidate_data.get("candidate"):
                     continue
 
-                # Дополнительная проверка: строка кандидата не должна быть пустой
                 candidate_str = candidate_data.get("candidate", "").strip()
                 if not candidate_str:
                     continue
