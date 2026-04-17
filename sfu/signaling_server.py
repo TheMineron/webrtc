@@ -2,8 +2,9 @@ import asyncio
 import json
 import logging
 import uuid
+from abc import ABCMeta, abstractmethod
 from contextlib import asynccontextmanager
-from typing import Awaitable, Callable, Final
+from typing import Awaitable, Callable, Final, TypeAlias
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -12,10 +13,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SFU_WS_URL = "wss://130.193.46.12:8001/ws"
+HEARTBEAT_TIMER: Final[int] = 30
+HEARTBEAT_TIMEOUT: Final[int] = 60
 
 
 class Participant:
-
     def __init__(self, websocket: WebSocket, nickname: str) -> None:
         self.id = str(uuid.uuid4())
         self.websocket = websocket
@@ -75,8 +77,10 @@ class RoomManager:
                 return room
         return None
 
-    def remove_participant_by_websocket(self, websocket: WebSocket) -> tuple[
-        Room | None, Participant | None]:
+    def remove_participant_by_websocket(
+            self,
+            websocket: WebSocket
+    ) -> 'RoomParticipantPair':
         for room in self.rooms.values():
             for pid, p in list(room.participants.items()):
                 if p.websocket == websocket:
@@ -99,7 +103,11 @@ async def safe_send_json(websocket: WebSocket, data: dict) -> None:
         logger.error(f"Failed to send message: {e}")
 
 
-async def broadcast_to_room(room: Room, message: dict, exclude_ws: WebSocket | None = None) -> None:
+async def broadcast_to_room(
+        room: Room,
+        message: dict,
+        exclude_ws: WebSocket | None = None
+) -> None:
     for participant in room.participants.values():
         if exclude_ws and participant.websocket == exclude_ws:
             continue
@@ -110,24 +118,29 @@ class CommandContext:
     def __init__(
             self,
             websocket: WebSocket,
-            room_manager: RoomManager,
+            manager: RoomManager,
             current_room: Room | None,
             current_participant: Participant | None,
     ) -> None:
         self.websocket = websocket
-        self.room_manager = room_manager
+        self.room_manager = manager
         self.current_room = current_room
         self.current_participant = current_participant
         self.should_leave = False
 
 
-RoomParticipantPair = tuple[Room | None, Participant | None]
-CommandHandler = Callable[[CommandContext, dict], Awaitable[RoomParticipantPair]]
+RoomParticipantPair: TypeAlias = tuple[Room | None, Participant | None]
+CommandHandler: TypeAlias = Callable[[CommandContext, dict], Awaitable[RoomParticipantPair]]
 
 
-class JoinCommand:
-    @staticmethod
-    async def handle(ctx: CommandContext, data: dict) -> RoomParticipantPair:
+class Command(metaclass=ABCMeta):
+    @abstractmethod
+    async def handle(self, ctx: CommandContext, data: dict) -> RoomParticipantPair:
+        pass
+
+
+class JoinCommand(Command):
+    async def handle(self, ctx: CommandContext, data: dict) -> RoomParticipantPair:
         room_id = data.get("room")
         nickname = data.get("nickname")
         if not room_id or not nickname:
@@ -137,7 +150,11 @@ class JoinCommand:
             })
             return ctx.current_room, ctx.current_participant
 
-        old_room, old_participant = ctx.room_manager.remove_participant_by_websocket(ctx.websocket)
+        old_room, old_participant = (
+            ctx
+            .room_manager
+            .remove_participant_by_websocket(ctx.websocket)
+        )
         if old_participant:
             logger.info(f"Removed {old_participant} from previous room {old_room}")
 
@@ -159,7 +176,10 @@ class JoinCommand:
             room,
             message={
                 "type": "participant_joined",
-                "participant": {"id": participant.id, "name": nickname}
+                "participant": {
+                    "id": participant.id,
+                    "name": nickname
+                }
             },
             exclude_ws=ctx.websocket
         )
@@ -173,9 +193,8 @@ class JoinCommand:
         return room, participant
 
 
-class PingCommand:
-    @staticmethod
-    async def handle(ctx: CommandContext, data: dict) -> RoomParticipantPair:
+class PingCommand(Command):
+    async def handle(self, ctx: CommandContext, data: dict) -> RoomParticipantPair:
         if ctx.current_participant:
             ctx.current_participant.last_pong = asyncio.get_event_loop().time()
             timestamp = data.get("timestamp")
@@ -187,9 +206,8 @@ class PingCommand:
         return ctx.current_room, ctx.current_participant
 
 
-class LeaveCommand:
-    @staticmethod
-    async def handle(ctx: CommandContext, data: dict) -> RoomParticipantPair:
+class LeaveCommand(Command):
+    async def handle(self, ctx: CommandContext, data: dict) -> RoomParticipantPair:
         ctx.should_leave = True
         await safe_send_json(ctx.websocket, {
             "type": "left",
@@ -199,37 +217,38 @@ class LeaveCommand:
 
 
 COMMAND_HANDLERS: Final[dict[str, CommandHandler]] = {
-    "join": JoinCommand.handle,
-    "ping": PingCommand.handle,
-    "leave": LeaveCommand.handle,
+    "join": JoinCommand().handle,
+    "ping": PingCommand().handle,
+    "leave": LeaveCommand().handle,
 }
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(application: FastAPI):
     async def heartbeat_checker():
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(HEARTBEAT_TIMER)
             now = asyncio.get_event_loop().time()
-            # Iterate over a snapshot of rooms to avoid modification during iteration
             for room in list(room_manager.rooms.values()):
                 for participant_id, participant in list(room.participants.items()):
-                    if now - participant.last_pong > 60:
+                    if now - participant.last_pong > HEARTBEAT_TIMEOUT:
                         logger.warning(
-                            f"Participant {participant.nickname} heartbeat timeout, closing")
+                            f"Participant {participant.nickname} "
+                            f"heartbeat timeout, closing"
+                        )
                         try:
                             await participant.websocket.close(code=1000)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning(str(e))
                         room.remove(participant_id)
                 if not room.participants:
                     room_manager.remove_if_empty(room.id)
 
     task = asyncio.create_task(heartbeat_checker())
-    logger.info("Signaling server started")
+    logger.info(f"Signaling server started: {application}")
     yield
     task.cancel()
-    logger.info("Signaling server stopped")
+    logger.info(f"Signaling server stopped: {application}")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -248,7 +267,13 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                await safe_send_json(websocket, {"type": "error", "message": "Invalid JSON"})
+                await safe_send_json(
+                    websocket,
+                    data={
+                        "type": "error",
+                        "message": "Invalid JSON"
+                    }
+                )
                 continue
 
             msg_type = msg.get("type")
@@ -258,10 +283,21 @@ async def websocket_endpoint(websocket: WebSocket):
             handler = COMMAND_HANDLERS.get(msg_type)
             if handler is None:
                 logger.debug(f"Unknown message type: {msg_type}")
-                await safe_send_json(websocket, {"type": "error", "message": "Unknown command"})
+                await safe_send_json(
+                    websocket,
+                    data={
+                        "type": "error",
+                        "message": "Unknown command"
+                    }
+                )
                 continue
 
-            ctx = CommandContext(websocket, room_manager, current_room, current_participant)
+            ctx = CommandContext(
+                websocket,
+                room_manager,
+                current_room,
+                current_participant
+            )
             try:
                 new_room, new_participant = await handler(ctx, msg)
                 current_room, current_participant = new_room, new_participant
@@ -269,7 +305,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     break
             except Exception as e:
                 logger.exception(f"Error processing command {msg_type}: {e}")
-                await safe_send_json(websocket, {"type": "error", "message": "Internal error"})
+                await safe_send_json(
+                    websocket,
+                    data={
+                        "type": "error",
+                        "message": "Internal error"
+                    }
+                )
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {current_participant}")
@@ -279,7 +321,8 @@ async def websocket_endpoint(websocket: WebSocket):
         if current_room and current_participant:
             removed = current_room.remove(current_participant.id)
             if removed:
-                logger.info(f"Participant {current_participant} removed from room {current_room}")
+                logger.info(f"Participant {current_participant} "
+                            f"removed from room {current_room}")
                 await broadcast_to_room(
                     current_room,
                     message={

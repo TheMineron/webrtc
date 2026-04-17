@@ -2,79 +2,100 @@ import asyncio
 import json
 import logging
 import ssl
-from typing import Dict, Set
+from typing import Dict, Set, Final, Optional
 
 import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 from aiortc.contrib.media import MediaRelay
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("sfu")
+logger = logging.getLogger(__name__)
+
+HEARTBEAT_TIMEOUT: Final[int] = 60
+ICE_CONSENT_TIMEOUT: Final[int] = 60
 
 relay = MediaRelay()
 
 
 class Room:
-    def __init__(self, room_id: str):
+    def __init__(self, room_id: str) -> None:
         self.id = room_id
         self.participants: Dict[str, "Participant"] = {}
 
-    def add_participant(self, participant: "Participant"):
+    def add_participant(self, participant: "Participant") -> None:
         self.participants[participant.id] = participant
-        logger.info(f"Participant {participant.id} added to room {self.id}")
+        logger.info(
+            f"Participant {participant.id} "
+            f"added to room {self.id}"
+        )
 
-    def remove_participant(self, participant_id: str):
+    def remove_participant(self, participant_id: str) -> None:
         if participant_id in self.participants:
             del self.participants[participant_id]
-            logger.info(f"Participant {participant_id} removed from room {self.id}")
-            if not self.participants:
-                rooms.pop(self.id, None)
-                logger.info(f"Room {self.id} deleted (empty)")
+            logger.info(
+                f"Participant {participant_id}"
+                f" removed from room {self.id}"
+            )
 
-    async def broadcast_track(self, sender_id: str, track, replace_existing: bool = True):
+    def is_empty(self) -> bool:
+        return len(self.participants) == 0
+
+    async def broadcast_track(
+            self,
+            sender_id: str,
+            track,
+            replace_existing: bool = True
+    ) -> None:
         logger.info(
             f"broadcast_track: sender={sender_id}, "
-            f"kind={track.kind}, "
-            f"replace={replace_existing}, "
+            f"kind={track.kind}, replace={replace_existing}, "
             f"participants={list(self.participants.keys())}"
         )
 
-        for pid, p in self.participants.items():
+        for pid, participant in self.participants.items():
             if pid != sender_id:
                 logger.info(f"Relaying track {track.kind} from {sender_id} to {pid}")
                 relayed_track = relay.subscribe(track)
-                await p.add_or_replace_track(sender_id, relayed_track, replace_existing)
+                await participant.add_or_replace_track(
+                    sender_id, relayed_track, replace_existing
+                )
 
-    async def send_existing_tracks_to_newcomer(self, newcomer_id: str):
+    async def send_existing_tracks_to_newcomer(self, newcomer_id: str) -> None:
         newcomer = self.participants.get(newcomer_id)
         if not newcomer:
             return
 
-        for pid, p in self.participants.items():
+        for pid, participant in self.participants.items():
             if pid == newcomer_id:
                 continue
-            for track in p.local_tracks:
-                logger.info(f"Sending existing track {track.kind} from {pid} to newcomer {newcomer_id}")
+            for track in participant.local_tracks:
+                logger.info(
+                    f"Sending existing track {track.kind} from {pid} "
+                    f"to newcomer {newcomer_id}"
+                )
                 relayed_track = relay.subscribe(track)
-                await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=False)
+                await newcomer.add_or_replace_track(
+                    pid, relayed_track, replace_existing=False
+                )
+
+    def __str__(self) -> str:
+        return self.id
 
 
 class Participant:
-    def __init__(self, participant_id: str, room: Room, websocket):
+
+    def __init__(self, participant_id: str, room: Room, websocket) -> None:
         self.id = participant_id
         self.room = room
         self.websocket = websocket
         self.peer_connection = RTCPeerConnection()
-        for transceiver in self.peer_connection.getTransceivers():
-            if hasattr(transceiver.sender, '_transport'):
-                transceiver.sender._transport._consent_timeout = 60
         self.local_tracks: Set = set()
         self.remote_senders: Dict[str, Dict[str, object]] = {}
         self._renegotiation_pending = False
         self._tracks_initialized = False
         self._setup_peer_connection_handlers()
 
-    def _setup_peer_connection_handlers(self):
+    def _setup_peer_connection_handlers(self) -> None:
         @self.peer_connection.on("track")
         async def on_track(track):
             logger.info(f"Track received from {self.id}: {track.kind}")
@@ -107,11 +128,15 @@ class Participant:
             state = self.peer_connection.signalingState
             logger.info(f"Signaling state for {self.id}: {state}")
 
-    async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True):
+    async def add_or_replace_track(
+            self,
+            sender_id: str,
+            track,
+            replace_existing: bool = True
+    ) -> None:
         logger.info(
             f"add_or_replace_track: sender={sender_id}, "
-            f"kind={track.kind}, "
-            f"replace={replace_existing}"
+            f"kind={track.kind}, replace={replace_existing}"
         )
 
         if sender_id not in self.remote_senders:
@@ -119,8 +144,7 @@ class Participant:
 
         senders = self.remote_senders[sender_id]
         existing_sender = senders.get(track.kind)
-
-        changed = False  # флаг, что произошло изменение
+        changed = False
 
         if replace_existing and existing_sender:
             logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
@@ -131,9 +155,14 @@ class Participant:
                 logger.error(f"Failed to replace track: {e}", exc_info=True)
         elif not replace_existing and existing_sender:
             logger.warning(
-                f"NOT replacing existing {track.kind} track from {sender_id} to {self.id} (replace_existing=False)")
+                f"NOT replacing existing {track.kind} track from {sender_id} "
+                f"to {self.id} (replace_existing=False)"
+            )
         else:
-            logger.info(f"Adding new {track.kind} track from {sender_id} to {self.id}")
+            logger.info(
+                f"Adding new {track.kind} track "
+                f"from {sender_id} to {self.id}"
+            )
             sender = self.peer_connection.addTrack(track)
             senders[track.kind] = sender
             changed = True
@@ -141,7 +170,7 @@ class Participant:
         if changed:
             await self.notify_renegotiation_needed()
 
-    async def notify_renegotiation_needed(self):
+    async def notify_renegotiation_needed(self) -> None:
         if self._renegotiation_pending:
             return
         self._renegotiation_pending = True
@@ -152,76 +181,107 @@ class Participant:
         except Exception as e:
             logger.error(f"Failed to send renegotiate notification: {e}")
 
-    async def close(self):
-        logger.info(f"Closing participant {self.id}, remote_senders: {self.remote_senders}")
+    async def close(self) -> None:
+        logger.info(
+            f"Closing participant {self.id}, "
+            f"remote_senders: {self.remote_senders}"
+        )
 
-        for pid, p in self.room.participants.items():
-            if pid != self.id and self.id in p.remote_senders:
-                for sender in p.remote_senders[self.id].values():
+        for pid, participant in self.room.participants.items():
+            if pid != self.id and self.id in participant.remote_senders:
+                for sender in participant.remote_senders[self.id].values():
                     if sender is None:
-                        logger.warning(f"Sender for {pid} is None, skipping")
                         continue
                     try:
-                        logger.info(f"Stopping sender {pid}: {sender}")
-                        try:
-                            result = sender.replaceTrack(None)
-                            if result is not None and hasattr(result, '__await__'):
-                                await result
-                        except Exception as e:
-                            logger.warning(f"Failed to stop track sender {sender}: {e}")
+                        logger.info(f"Stopping sender for {pid}: {sender}")
+                        result = sender.replaceTrack(None)
+                        if result is not None and hasattr(result, "__await__"):
+                            await result
                     except Exception as e:
-                        logger.warning(f"Failed to stop track sender: {e}", exc_info=True)
-                del p.remote_senders[self.id]
-                await p.notify_renegotiation_needed()
+                        logger.warning(f"Failed to stop track sender: {e}")
+                del participant.remote_senders[self.id]
+                await participant.notify_renegotiation_needed()
 
         self.room.remove_participant(self.id)
         await self.peer_connection.close()
 
-
-rooms: Dict[str, Room] = {}
-
-
-def create_ice_candidate_from_js(cand_data: dict) -> RTCIceCandidate:
-    if hasattr(RTCIceCandidate, "from_js"):
-        return RTCIceCandidate.from_js(cand_data)
-    else:
-        return RTCIceCandidate(
-            component=cand_data.get("component", 1),
-            foundation=cand_data.get("foundation", ""),
-            ip=cand_data.get("ip", ""),
-            port=cand_data.get("port", 0),
-            priority=cand_data.get("priority", 0),
-            protocol=cand_data.get("protocol", ""),
-            type=cand_data.get("type", ""),
-            relatedAddress=cand_data.get("relatedAddress"),
-            relatedPort=cand_data.get("relatedPort"),
-            sdpMid=cand_data.get("sdpMid"),
-            sdpMLineIndex=cand_data.get("sdpMLineIndex"),
-            tcpType=cand_data.get("tcpType")
-        )
+    def __str__(self) -> str:
+        return f"{self.id}"
 
 
-async def handle_client(websocket):
+class RoomManager:
+    def __init__(self) -> None:
+        self.rooms: Dict[str, Room] = {}
+
+    def get_or_create(self, room_id: str) -> Room:
+        if room_id not in self.rooms:
+            self.rooms[room_id] = Room(room_id)
+        return self.rooms[room_id]
+
+    def remove_if_empty(self, room_id: str) -> None:
+        room = self.rooms.get(room_id)
+        if room and room.is_empty():
+            del self.rooms[room_id]
+            logger.info(f"Room {room_id} deleted (empty)")
+
+    def find_room_by_participant_id(self, participant_id: str) -> Optional[Room]:
+        for room in self.rooms.values():
+            if participant_id in room.participants:
+                return room
+        return None
+
+
+room_manager = RoomManager()
+
+
+def create_ice_candidate_from_js(candidate_data: dict) -> RTCIceCandidate:
+    return RTCIceCandidate(
+        component=candidate_data.get("component", 1),
+        foundation=candidate_data.get("foundation", ""),
+        ip=candidate_data.get("ip", ""),
+        port=candidate_data.get("port", 0),
+        priority=candidate_data.get("priority", 0),
+        protocol=candidate_data.get("protocol", ""),
+        type=candidate_data.get("type", ""),
+        relatedAddress=candidate_data.get("relatedAddress"),
+        relatedPort=candidate_data.get("relatedPort"),
+        sdpMid=candidate_data.get("sdpMid"),
+        sdpMLineIndex=candidate_data.get("sdpMLineIndex"),
+        tcpType=candidate_data.get("tcpType"),
+    )
+
+
+async def handle_client(websocket) -> None:
     participant_id = None
     room = None
     participant = None
 
     try:
         async for message in websocket:
-            data = json.loads(message)
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "message": "Invalid JSON"
+                }))
+                continue
+
             msg_type = data.get("type")
 
             if msg_type == "join":
                 room_id = data.get("room")
                 participant_id = data.get("participant_id")
                 if not room_id or not participant_id:
-                    await websocket.send(json.dumps({"type": "error", "message": "room and participant_id required"}))
+                    await websocket.send(
+                        json.dumps({
+                            "type": "error",
+                            "message": "room and participant_id required"
+                        })
+                    )
                     continue
 
-                if room_id not in rooms:
-                    rooms[room_id] = Room(room_id)
-                room = rooms[room_id]
-
+                room = room_manager.get_or_create(room_id)
                 participant = Participant(participant_id, room, websocket)
                 room.add_participant(participant)
 
@@ -229,8 +289,12 @@ async def handle_client(websocket):
 
             elif msg_type == "offer":
                 if not participant:
-                    await websocket.send(json.dumps({"type": "error", "message": "Not joined"}))
+                    await websocket.send(json.dumps({
+                        "type": "error",
+                        "message": "Not joined"
+                    }))
                     continue
+
                 logger.info(f"Received offer from {participant.id}")
                 offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
                 await participant.peer_connection.setRemoteDescription(offer)
@@ -242,16 +306,24 @@ async def handle_client(websocket):
                 if participant.peer_connection.signalingState == "have-remote-offer":
                     answer = await participant.peer_connection.createAnswer()
                     await participant.peer_connection.setLocalDescription(answer)
-                    await websocket.send(json.dumps({
-                        "type": "answer",
-                        "sdp": participant.peer_connection.localDescription.sdp
-                    }))
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "answer",
+                                "sdp": participant.peer_connection.localDescription.sdp,
+                            }
+                        )
+                    )
                     participant._renegotiation_pending = False
 
             elif msg_type == "answer":
                 if not participant:
-                    await websocket.send(json.dumps({"type": "error", "message": "Not joined"}))
+                    await websocket.send(json.dumps({
+                        "type": "error",
+                        "message": "Not joined"
+                    }))
                     continue
+
                 answer = RTCSessionDescription(sdp=data["sdp"], type="answer")
                 await participant.peer_connection.setRemoteDescription(answer)
                 participant._renegotiation_pending = False
@@ -259,11 +331,13 @@ async def handle_client(websocket):
             elif msg_type == "ice-candidate":
                 if not participant:
                     continue
-                cand_data = data["candidate"]
-                if not cand_data or not cand_data.get("candidate"):
+
+                candidate_data = data.get("candidate")
+                if not candidate_data or not candidate_data.get("candidate"):
                     continue
+
                 try:
-                    candidate = create_ice_candidate_from_js(cand_data)
+                    candidate = create_ice_candidate_from_js(candidate_data)
                     await participant.peer_connection.addIceCandidate(candidate)
                 except Exception as e:
                     logger.warning(f"Failed to add ICE candidate: {e}")
@@ -272,7 +346,12 @@ async def handle_client(websocket):
                 break
 
             else:
-                await websocket.send(json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
+                await websocket.send(
+                    json.dumps({
+                        "type": "error",
+                        "message": f"Unknown message type: {msg_type}"
+                    })
+                )
 
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"WebSocket closed for {participant_id}")
@@ -281,10 +360,12 @@ async def handle_client(websocket):
     finally:
         if participant:
             await participant.close()
+            if room and room.is_empty():
+                room_manager.remove_if_empty(room.id)
         logger.info(f"Client {participant_id} disconnected")
 
 
-async def main():
+async def main() -> None:
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     try:
         ssl_context.load_cert_chain("cert.pem", "key.pem")
@@ -295,11 +376,11 @@ async def main():
         proto = "ws"
 
     async with websockets.serve(
-        handle_client,
-        "0.0.0.0",
-        8001,
-        ssl=ssl_context,
-        max_size=10**7,
+            handle_client,
+            "0.0.0.0",
+            8001,
+            ssl=ssl_context,
+            max_size=10 ** 7,
     ):
         logger.info(f"SFU server started on {proto}://0.0.0.0:8001")
         await asyncio.Future()
