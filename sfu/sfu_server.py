@@ -88,6 +88,7 @@ class Participant:
         self.peer_connection = RTCPeerConnection()
         self.local_tracks: Set = set()
         self.remote_senders: Dict[str, Dict[str, object]] = {}
+        self.pending_tracks = []
         self._renegotiation_pending = False
         self._tracks_initialized = False
         self._setup_peer_connection_handlers()
@@ -124,6 +125,11 @@ class Participant:
         async def on_signalingstatechange():
             state = self.peer_connection.signalingState
             logger.info(f"Signaling state for {self.id}: {state}")
+            if state == "stable" and self.pending_tracks:
+                pending = self.pending_tracks.copy()
+                self.pending_tracks.clear()
+                for sender_id, track, replace_existing in pending:
+                    await self.add_or_replace_track(sender_id, track, replace_existing)
 
     async def add_or_replace_track(
             self,
@@ -131,8 +137,17 @@ class Participant:
             track,
             replace_existing: bool = True
     ) -> None:
+        if self.peer_connection.signalingState != "stable":
+            logger.info(
+                f"Deferring add track for {sender_id} ({track.kind}) "
+                f"because signalingState is {self.peer_connection.signalingState}"
+            )
+            self.pending_tracks.append((sender_id, track, replace_existing))
+            return
+
         logger.info(
-            f"add_or_replace_track: sender={sender_id}, kind={track.kind}, replace={replace_existing}")
+            f"add_or_replace_track: sender={sender_id}, kind={track.kind}, replace={replace_existing}"
+        )
 
         if sender_id not in self.remote_senders:
             self.remote_senders[sender_id] = {}
@@ -143,16 +158,17 @@ class Participant:
         if replace_existing and existing_sender:
             logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
             await existing_sender.replaceTrack(track)
-            # При замене трека не нужно вызывать renegotiation, если направление не меняется
             return
 
         if not replace_existing and existing_sender:
             logger.warning(f"Track {track.kind} already exists, skipping")
             return
 
-        # Новый трек – создаём transceiver с явным направлением sendonly
         logger.info(f"Adding new {track.kind} transceiver for {sender_id}")
         transceiver = self.peer_connection.addTransceiver(track.kind, direction='sendonly')
+        if transceiver is None or transceiver.sender is None:
+            logger.error(f"Failed to create transceiver for {track.kind}: transceiver={transceiver}")
+            return
         sender = transceiver.sender
         await sender.replaceTrack(track)
         senders[track.kind] = sender
