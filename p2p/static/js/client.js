@@ -18,6 +18,8 @@ let conferenceStartTime = null;
 const peers = new Map();
 const prevStatsMap = new Map();
 
+let originalVideoTrack = null;
+let canvasStream = null;
 let callStartTime = null;
 let firstVideoFrameTime = null;
 
@@ -29,12 +31,14 @@ let e2eMonitorInterval = null;
 let collectStatsInterval = null;
 let e2eTestInterval = null;
 let dataChannelPingInterval = null;
+let websocketPingInterval = null;
 
 let statsHistory = {
     bitrate: [],
     jitter: [],
     rttIce: [],
     rttDataChannel: [],
+    rttWebsocket: [],
     lipSync: []
 };
 
@@ -42,8 +46,8 @@ let lastDataChannelRtt = null;
 
 const pcConfig = {
     iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
+        {urls: 'stun:stun.l.google.com:19302'},
+        {urls: 'stun:stun1.l.google.com:19302'},
         {
             urls: [
                 'turn:178.154.215.177:3478?transport=udp',
@@ -55,33 +59,42 @@ const pcConfig = {
     ],
     iceCandidatePoolSize: 10
 };
+async function flashColorOnStream(color, duration = 300) {
+    if (!localStream) return;
 
-let canvasOverlay = null;
+    const videoTrack = localStream.getVideoTracks()[0];
+    if (!videoTrack) return;
+    originalVideoTrack = videoTrack;
 
-function startColorFlash(color, duration = 300) {
-    if (!localVideo.srcObject) return;
-    if (!canvasOverlay) {
-        canvasOverlay = document.createElement('canvas');
-        canvasOverlay.style.position = 'absolute';
-        canvasOverlay.style.top = 0;
-        canvasOverlay.style.left = 0;
-        canvasOverlay.style.width = '100%';
-        canvasOverlay.style.height = '100%';
-        canvasOverlay.style.pointerEvents = 'none';
-        canvasOverlay.style.zIndex = 10;
-        localVideo.parentElement.style.position = 'relative';
-        localVideo.parentElement.appendChild(canvasOverlay);
-    }
-    canvasOverlay.width = localVideo.videoWidth || 640;
-    canvasOverlay.height = localVideo.videoHeight || 480;
-    const ctx = canvasOverlay.getContext('2d');
+    const canvas = document.createElement('canvas');
+    canvas.width = 640;
+    canvas.height = 480;
+    const ctx = canvas.getContext('2d');
     ctx.fillStyle = color;
-    ctx.fillRect(0, 0, canvasOverlay.width, canvasOverlay.height);
-    setTimeout(() => {
-        if (canvasOverlay) {
-            const ctx2 = canvasOverlay.getContext('2d');
-            ctx2.clearRect(0, 0, canvasOverlay.width, canvasOverlay.height);
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    canvasStream = canvas.captureStream(30);
+    const colorTrack = canvasStream.getVideoTracks()[0];
+
+    localStream.removeTrack(videoTrack);
+    localStream.addTrack(colorTrack);
+
+    for (const [, peerInfo] of peers.entries()) {
+        const senders = peerInfo.pc.getSenders();
+        const videoSender = senders.find(s => s.track?.kind === 'video');
+        if (videoSender) await videoSender.replaceTrack(colorTrack);
+    }
+
+    setTimeout(async () => {
+        localStream.removeTrack(colorTrack);
+        localStream.addTrack(originalVideoTrack);
+        for (const [, peerInfo] of peers.entries()) {
+            const senders = peerInfo.pc.getSenders();
+            const videoSender = senders.find(s => s.track?.kind === 'video');
+            if (videoSender) await videoSender.replaceTrack(originalVideoTrack);
         }
+        colorTrack.stop();
+        canvasStream = null;
     }, duration);
 }
 
@@ -128,23 +141,24 @@ function connectWebSocket(roomId, nickname) {
         if (collectStatsInterval) clearInterval(collectStatsInterval);
         if (e2eTestInterval) clearInterval(e2eTestInterval);
         if (dataChannelPingInterval) clearInterval(dataChannelPingInterval);
-        statsHistory = { bitrate: [], jitter: [], rttIce: [], rttDataChannel: [], lipSync: [] };
+        if (websocketPingInterval) clearInterval(websocketPingInterval);
+        statsHistory = {bitrate: [], jitter: [], rttIce: [], rttDataChannel: [], rttWebsocket: [], lipSync: []};
     };
 }
 
 function sendJoin(roomId, nickname) {
-    const msg = { type: 'join', room: roomId, nickname: nickname };
+    const msg = {type: 'join', room: roomId, nickname: nickname};
     ws.send(JSON.stringify(msg));
 }
 
 function sendSignal(targetId, data) {
-    const msg = { type: 'signal', target_id: targetId, data: data };
+    const msg = {type: 'signal', target_id: targetId, data: data};
     ws.send(JSON.stringify(msg));
 }
 
 function sendPing() {
     const timestamp = Date.now();
-    const msg = { type: 'ping', timestamp: timestamp };
+    const msg = {type: 'ping', timestamp: timestamp};
     ws.send(JSON.stringify(msg));
     return timestamp;
 }
@@ -178,15 +192,35 @@ async function handleSignalingMessage(msg) {
             break;
 
         case 'signal':
-            console.log(`[SIGNAL] от ${msg.from_id}, тип: ${msg.data?.type}`);
-            await handleSignal(msg.from_id, msg.data);
+            const signal = msg.data;
+            if (signal.type === 'e2e_test_start') {
+                startE2eReceiver(msg.from_id);
+            } else if (signal.type === 'e2e_color_change') {
+                if (msg.from_id !== currentParticipantId && e2eRemoteMonitor) {
+                    e2eStartTime = signal.timestamp;
+                    console.log(`[E2E] Ожидаем цвет ${signal.color}, отправлено в ${e2eStartTime}`);
+                }
+            } else if (signal.type === 'e2e_result') {
+                if (msg.from_id !== currentParticipantId && e2eTestInProgress) {
+                    const delay = signal.delay;
+                    latencyResultDiv.innerHTML += `<p>🎬 End-to-end задержка видео: ${delay} мс</p>`;
+                    e2eTestInProgress = false;
+                    if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
+                    e2eRemoteMonitor = false;
+                }
+            } else {
+                await handleSignal(msg.from_id, signal);
+            }
             break;
 
-        case 'pong':
+        case 'pong': {
             const rtt = Date.now() - msg.timestamp;
             console.log(`[PONG] RTT = ${rtt} мс`);
+            statsHistory.rttWebsocket.push(rtt);
+            if (statsHistory.rttWebsocket.length > 50) statsHistory.rttWebsocket.shift();
             latencyResultDiv.innerHTML = `<p>⏱️ RTT через WebSocket: ${rtt} мс</p>`;
             break;
+        }
 
         case 'e2e_test_start':
             if (msg.from_id !== currentParticipantId) {
@@ -271,7 +305,7 @@ async function createPeerConnection(remoteId, isInitiator) {
 
     pc.onicecandidate = (event) => {
         if (event.candidate) {
-            sendSignal(remoteId, { type: 'ice-candidate', candidate: event.candidate });
+            sendSignal(remoteId, {type: 'ice-candidate', candidate: event.candidate});
         }
     };
 
@@ -299,7 +333,7 @@ async function createPeerConnection(remoteId, isInitiator) {
         try {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
-            sendSignal(remoteId, { type: 'offer', sdp: offer.sdp });
+            sendSignal(remoteId, {type: 'offer', sdp: offer.sdp});
         } catch (err) {
             console.error(`[OFFER] Ошибка:`, err);
         }
@@ -312,7 +346,7 @@ function setupDataChannel(dc, remoteId) {
     dc.onmessage = (event) => {
         const data = JSON.parse(event.data);
         if (data.type === 'e2e_ping') {
-            dc.send(JSON.stringify({ type: 'e2e_pong', sendTime: data.sendTime }));
+            dc.send(JSON.stringify({type: 'e2e_pong', sendTime: data.sendTime}));
         } else if (data.type === 'e2e_pong') {
             const rtt = Date.now() - data.sendTime;
             statsHistory.rttDataChannel.push(rtt);
@@ -334,17 +368,17 @@ async function handleSignal(fromId, signalData) {
     try {
         switch (signalData.type) {
             case 'offer':
-                await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: signalData.sdp }));
+                await pc.setRemoteDescription(new RTCSessionDescription({type: 'offer', sdp: signalData.sdp}));
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                sendSignal(fromId, { type: 'answer', sdp: answer.sdp });
+                sendSignal(fromId, {type: 'answer', sdp: answer.sdp});
                 for (const cand of peerInfo.pendingCandidates) {
                     await pc.addIceCandidate(cand);
                 }
                 peerInfo.pendingCandidates = [];
                 break;
             case 'answer':
-                await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: signalData.sdp }));
+                await pc.setRemoteDescription(new RTCSessionDescription({type: 'answer', sdp: signalData.sdp}));
                 for (const cand of peerInfo.pendingCandidates) {
                     await pc.addIceCandidate(cand);
                 }
@@ -379,7 +413,7 @@ function removePeer(remoteId) {
 }
 
 function cleanupAllPeers() {
-    for (const [id, peerInfo] of peers.entries()) {
+    for (const [, peerInfo] of peers.entries()) {
         peerInfo.pc.close();
         if (peerInfo.videoElement) peerInfo.videoElement.srcObject = null;
     }
@@ -389,7 +423,7 @@ function cleanupAllPeers() {
 
 async function initLocalMedia() {
     try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
         localVideo.srcObject = localStream;
         for (const [remoteId, peerInfo] of peers.entries()) {
             localStream.getTracks().forEach(track => {
@@ -398,7 +432,7 @@ async function initLocalMedia() {
             if (peerInfo.pc.signalingState === 'stable' && peerInfo.pc.remoteDescription) {
                 const offer = await peerInfo.pc.createOffer();
                 await peerInfo.pc.setLocalDescription(offer);
-                sendSignal(remoteId, { type: 'offer', sdp: offer.sdp });
+                sendSignal(remoteId, {type: 'offer', sdp: offer.sdp});
             }
         }
     } catch (err) {
@@ -424,13 +458,19 @@ function startPeriodicTasks() {
 
     dataChannelPingInterval = setInterval(() => {
         if (peers.size > 0) {
-            for (const [remoteId, peerInfo] of peers.entries()) {
+            for (const [, peerInfo] of peers.entries()) {
                 if (peerInfo.dataChannel && peerInfo.dataChannel.readyState === 'open') {
                     const sendTime = Date.now();
-                    peerInfo.dataChannel.send(JSON.stringify({ type: 'e2e_ping', sendTime }));
+                    peerInfo.dataChannel.send(JSON.stringify({type: 'e2e_ping', sendTime}));
                     break;
                 }
             }
+        }
+    }, 3000);
+
+    websocketPingInterval = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            sendPing();
         }
     }, 3000);
 }
@@ -441,9 +481,9 @@ function startE2eVideoLatencyTest() {
     e2eTestInProgress = true;
 
     const remoteId = peers.keys().next().value;
-    sendSignal(remoteId, { type: 'e2e_test_start' });
+    sendSignal(remoteId, {type: 'e2e_test_start'});
 
-    setTimeout(() => {
+    setTimeout(async () => {
         if (!localStream) {
             e2eTestInProgress = false;
             return;
@@ -451,7 +491,7 @@ function startE2eVideoLatencyTest() {
         e2eStartTime = Date.now();
         const colors = ['red', 'lime', 'blue', 'yellow', 'magenta'];
         const color = colors[Math.floor(Math.random() * colors.length)];
-        startColorFlash(color, 300);
+        await flashColorOnStream(color, 300);
         sendSignal(remoteId, {
             type: 'e2e_color_change',
             timestamp: e2eStartTime,
@@ -464,7 +504,7 @@ function startE2eVideoLatencyTest() {
                 e2eTestInProgress = false;
                 if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
             }
-        }, 5000);
+        }, 10000);
     }, 500);
 }
 
@@ -504,7 +544,7 @@ function startE2eReceiver(senderId) {
             lastColor = dominant;
             const detectTime = Date.now();
             const delay = detectTime - e2eStartTime;
-            sendSignal(senderId, { type: 'e2e_result', delay: delay });
+            sendSignal(senderId, {type: 'e2e_result', delay: delay});
             e2eRemoteMonitor = false;
             clearInterval(e2eMonitorInterval);
         }
@@ -542,19 +582,19 @@ async function collectStats() {
                     if (statsHistory.bitrate.length > 50) statsHistory.bitrate.shift();
                 }
             }
-            prevStatsMap.set(remoteId, { bytes: currentBytes, timestamp: now });
+            prevStatsMap.set(remoteId, {bytes: currentBytes, timestamp: now});
 
             currentJitter = (inboundVideo.jitter * 1000);
             statsHistory.jitter.push(currentJitter);
             if (statsHistory.jitter.length > 50) statsHistory.jitter.shift();
 
-            statsText += `Участник ${remoteId.slice(0,6)}:\n`;
+            statsText += `Участник ${remoteId.slice(0, 6)}:\n`;
             statsText += `  Битрейт видео: ${currentBitrate.toFixed(2)} kbps\n`;
             statsText += `  Потеря пакетов: ${inboundVideo.packetsLost}\n`;
             statsText += `  Джиттер: ${currentJitter.toFixed(2)} мс\n`;
             hasData = true;
         } else {
-            statsText += `Участник ${remoteId.slice(0,6)}: нет видео-потока\n`;
+            statsText += `Участник ${remoteId.slice(0, 6)}: нет видео-потока\n`;
         }
 
         if (candidatePair) {
@@ -582,12 +622,14 @@ async function collectStats() {
         statsText = 'Нет активных соединений\n';
     }
 
-    const avgBitrate = statsHistory.bitrate.length ? (statsHistory.bitrate.reduce((a,b)=>a+b,0)/statsHistory.bitrate.length).toFixed(2) : '—';
-    const avgJitter = statsHistory.jitter.length ? (statsHistory.jitter.reduce((a,b)=>a+b,0)/statsHistory.jitter.length).toFixed(2) : '—';
-    const avgRttIce = statsHistory.rttIce.length ? (statsHistory.rttIce.reduce((a,b)=>a+b,0)/statsHistory.rttIce.length).toFixed(2) : '—';
-    const avgRttData = statsHistory.rttDataChannel.length ? (statsHistory.rttDataChannel.reduce((a,b)=>a+b,0)/statsHistory.rttDataChannel.length).toFixed(2) : '—';
-    const avgLipSync = statsHistory.lipSync.length ? (statsHistory.lipSync.reduce((a,b)=>a+b,0)/statsHistory.lipSync.length).toFixed(2) : '—';
-
+    const avgBitrate = statsHistory.bitrate.length ? (statsHistory.bitrate.reduce((a, b) => a + b, 0) / statsHistory.bitrate.length).toFixed(2) : '—';
+    const avgJitter = statsHistory.jitter.length ? (statsHistory.jitter.reduce((a, b) => a + b, 0) / statsHistory.jitter.length).toFixed(2) : '—';
+    const avgRttIce = statsHistory.rttIce.length ? (statsHistory.rttIce.reduce((a, b) => a + b, 0) / statsHistory.rttIce.length).toFixed(2) : '—';
+    const avgRttData = statsHistory.rttDataChannel.length ? (statsHistory.rttDataChannel.reduce((a, b) => a + b, 0) / statsHistory.rttDataChannel.length).toFixed(2) : '—';
+    const avgLipSync = statsHistory.lipSync.length ? (statsHistory.lipSync.reduce((a, b) => a + b, 0) / statsHistory.lipSync.length).toFixed(2) : '—';
+    const avgRttWebsocket = statsHistory.rttWebsocket.length
+        ? (statsHistory.rttWebsocket.reduce((a, b) => a + b, 0) / statsHistory.rttWebsocket.length).toFixed(2)
+        : '—';
     let conferenceDuration = '—';
     if (conferenceStartTime) {
         const durationSec = (Date.now() - conferenceStartTime) / 1000;
@@ -600,8 +642,10 @@ async function collectStats() {
     statsText += `Средний битрейт: ${avgBitrate} kbps\n`;
     statsText += `Средний джиттер: ${avgJitter} мс\n`;
     statsText += `Средний RTT ICE: ${avgRttIce} мс\n`;
+    statsText += `Средний RTT WebSocket: ${avgRttWebsocket} мс\n`;
     statsText += `Средний RTT DataChannel: ${avgRttData} мс\n`;
     statsText += `Среднее расхождение аудио/видео: ${avgLipSync} мс\n`;
+
 
     webrtcStatsDiv.innerHTML = `<pre>${statsText}</pre>`;
 }
