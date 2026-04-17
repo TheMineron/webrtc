@@ -1,31 +1,77 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SFU WebRTC Demo</title>
-    <style>
-        body { font-family: sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
-        .controls { margin-bottom: 20px; }
-        input, button { padding: 8px 12px; font-size: 16px; margin-right: 10px; }
-        #videos { display: flex; flex-wrap: wrap; gap: 10px; }
-        video { width: 300px; height: 200px; background: #333; object-fit: cover; border-radius: 8px; }
-        .video-container { position: relative; }
-        .label { position: absolute; bottom: 5px; left: 5px; color: white; background: rgba(0,0,0,0.5); padding: 2px 6px; border-radius: 4px; }
-        #status { margin: 10px 0; color: #666; }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SFU WebRTC Demo</title>
+  <style>
+      body {
+          font-family: sans-serif;
+          max-width: 1200px;
+          margin: 0 auto;
+          padding: 20px;
+      }
+
+      .controls {
+          margin-bottom: 20px;
+      }
+
+      input, button {
+          padding: 8px 12px;
+          font-size: 16px;
+          margin-right: 10px;
+      }
+
+      #videos {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+      }
+
+      video {
+          width: 300px;
+          height: 200px;
+          background: #333;
+          object-fit: cover;
+          border-radius: 8px;
+      }
+
+      .video-container {
+          position: relative;
+      }
+
+      .label {
+          position: absolute;
+          bottom: 5px;
+          left: 5px;
+          color: white;
+          background: rgba(0, 0, 0, 0.5);
+          padding: 2px 6px;
+          border-radius: 4px;
+      }
+
+      #status {
+          margin: 10px 0;
+          color: #666;
+      }
+  </style>
 </head>
 <body>
-    <h1>SFU Video Conference</h1>
-    <div class="controls">
-        <input type="text" id="roomInput" placeholder="Room ID" value="test-room">
-        <input type="text" id="nameInput" placeholder="Your Name" value="User">
-        <button id="joinBtn">Join Room</button>
-        <button id="leaveBtn" disabled>Leave</button>
-    </div>
-    <div id="status">Not connected</div>
-    <div id="videos"></div>
-
-    <script src="/static/js/client.js"></script>
+<h1>SFU Video Conference</h1>
+<div class="controls">
+  <input type="text" id="roomInput" placeholder="Room ID" value="test-room">
+  <input type="text" id="nameInput" placeholder="Your Name" value="User">
+  <button id="joinBtn">Join Room</button>
+  <button id="leaveBtn" disabled>Leave</button>
+</div>
+<div id="status">Not connected</div>
+<div id="videos"></div>
+<div id="metrics-panel" style="margin-top: 20px; padding: 10px; border-top: 1px solid #ccc;">
+  <button id="startLatencyTest">📡 Измерить задержку (WebSocket RTT)</button>
+  <div id="latencyResult" style="margin-top: 5px;"></div>
+  <div id="webrtcStats"
+       style="margin-top: 10px; background: #f5f5f5; padding: 8px; font-family: monospace; white-space: pre-wrap;"></div>
+</div>
+<script src="/static/js/client.js"></script>
 </body>
 </html>

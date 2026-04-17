@@ -29,7 +29,7 @@ class RoomInfo:
 
 rooms: Dict[str, RoomInfo] = {}
 
-SFU_WS_URL = "wss://178.154.233.36:8001/ws"
+SFU_WS_URL = "wss://130.193.46.12:8001/ws"
 
 
 @asynccontextmanager

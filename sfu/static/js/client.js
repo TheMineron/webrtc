@@ -1,12 +1,12 @@
-const signalingUrl = 'wss://130.193.35.201:8000/ws';
+const signalingUrl = 'wss://130.193.46.12:8000/ws';
 const pcConfig = {
     iceServers: [
-        {urls: 'stun:stun.l.google.com:19302'},
-        {urls: 'stun:stun1.l.google.com:19302'},
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
         {
             urls: [
-                'turn:178.154.213.197:3478?transport=udp',
-                'turn:178.154.213.197:3478?transport=tcp'
+                'turn:178.154.215.177:3478?transport=udp',
+                'turn:178.154.215.177:3478?transport=tcp'
             ],
             username: 'webrtc',
             credential: 'webrtc_password'
@@ -25,15 +25,23 @@ let nickname = '';
 let renegotiationInProgress = false;
 const remoteVideoElements = new Map();
 
+// --- Элементы DOM ---
 const videosContainer = document.getElementById('videos');
 const statusDiv = document.getElementById('status');
 const joinBtn = document.getElementById('joinBtn');
 const leaveBtn = document.getElementById('leaveBtn');
 const roomInput = document.getElementById('roomInput');
 const nameInput = document.getElementById('nameInput');
+const startLatencyTestBtn = document.getElementById('startLatencyTest');
+const latencyResultDiv = document.getElementById('latencyResult');
+const webrtcStatsDiv = document.getElementById('webrtcStats');
+
+// --- Переменные для сбора статистики ---
+const prevStatsMap = new Map(); // remoteId (тут только SFU) -> { bytes, timestamp }
 
 joinBtn.onclick = joinRoom;
 leaveBtn.onclick = leaveRoom;
+startLatencyTestBtn.onclick = sendPing;
 
 function updateStatus(text) {
     statusDiv.textContent = text;
@@ -58,6 +66,105 @@ function addVideoElement(stream, label, isLocal = false) {
     return video;
 }
 
+// --- WebSocket ping для измерения RTT ---
+function sendPing() {
+    if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
+        const timestamp = Date.now();
+        signalingSocket.send(JSON.stringify({
+            type: 'ping',
+            timestamp: timestamp
+        }));
+        latencyResultDiv.innerHTML = '<p>⏱️ Измерение...</p>';
+        console.log('[PING] Отправлен ping');
+    } else {
+        alert('Сигнальный WebSocket не подключён');
+    }
+}
+
+// --- Периодический сбор статистики WebRTC ---
+async function collectStats() {
+    if (!sfuPeerConnection) {
+        webrtcStatsDiv.innerHTML = '<pre>Нет активного соединения с SFU</pre>';
+        return;
+    }
+
+    if (sfuPeerConnection.iceConnectionState !== 'connected' &&
+        sfuPeerConnection.iceConnectionState !== 'completed') {
+        webrtcStatsDiv.innerHTML = `<pre>Состояние ICE: ${sfuPeerConnection.iceConnectionState}</pre>`;
+        return;
+    }
+
+    try {
+        const stats = await sfuPeerConnection.getStats();
+        const now = Date.now();
+        let inboundRtpStats = null;
+        let candidatePairStats = null;
+        let remoteInboundStats = null;
+
+        stats.forEach(report => {
+            // Входящий видеопоток (от SFU)
+            if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                inboundRtpStats = report;
+            }
+            // Активная ICE-пара
+            if (report.type === 'candidate-pair' && report.nominated === true) {
+                candidatePairStats = report;
+            }
+            // Статистика удалённого входящего потока (для RTT)
+            if (report.type === 'remote-inbound-rtp' && report.kind === 'video') {
+                remoteInboundStats = report;
+            }
+        });
+
+        let statsText = '📊 Статистика WebRTC (SFU):\n';
+
+        if (inboundRtpStats) {
+            const currentBytes = inboundRtpStats.bytesReceived || 0;
+            const prev = prevStatsMap.get('sfu');
+            let bitrateKbps = 0;
+
+            if (prev && prev.bytes !== undefined && prev.timestamp) {
+                const bytesDiff = currentBytes - prev.bytes;
+                const timeDiffSec = (now - prev.timestamp) / 1000;
+                if (timeDiffSec > 0 && bytesDiff >= 0) {
+                    bitrateKbps = (bytesDiff * 8) / timeDiffSec / 1000;
+                }
+            }
+
+            prevStatsMap.set('sfu', { bytes: currentBytes, timestamp: now });
+
+            statsText += `  Битрейт видео: ${bitrateKbps.toFixed(2)} kbps\n`;
+            statsText += `  Потеря пакетов: ${inboundRtpStats.packetsLost || 0}\n`;
+            statsText += `  Джиттер: ${(inboundRtpStats.jitter || 0).toFixed(4)} с\n`;
+            statsText += `  Декодировано кадров: ${inboundRtpStats.framesDecoded || 0}\n`;
+        } else {
+            statsText += `  Нет данных о входящем видео\n`;
+        }
+
+        // RTT из ICE-пары
+        if (candidatePairStats && candidatePairStats.currentRoundTripTime) {
+            statsText += `  RTT (ICE): ${(candidatePairStats.currentRoundTripTime * 1000).toFixed(2)} мс\n`;
+        } else if (remoteInboundStats && remoteInboundStats.roundTripTime) {
+            statsText += `  RTT (RTCP): ${(remoteInboundStats.roundTripTime * 1000).toFixed(2)} мс\n`;
+        } else {
+            statsText += `  RTT: неизвестно\n`;
+        }
+
+        webrtcStatsDiv.innerHTML = `<pre>${statsText}</pre>`;
+    } catch (err) {
+        console.error('Ошибка сбора статистики:', err);
+        webrtcStatsDiv.innerHTML = '<pre>Ошибка получения статистики</pre>';
+    }
+}
+
+// Запускаем сбор статистики каждые 5 секунд
+setInterval(() => {
+    if (sfuPeerConnection) {
+        collectStats();
+    }
+}, 5000);
+
+// --- Обработка сигнальных сообщений (добавлен ping/pong) ---
 async function joinRoom() {
     roomId = roomInput.value.trim();
     nickname = nameInput.value.trim();
@@ -83,18 +190,35 @@ async function joinRoom() {
         const msg = JSON.parse(event.data);
         console.log('Signaling message:', msg);
 
-        if (msg.type === 'joined') {
-            participantId = msg.participant_id;
-            const sfuUrl = msg.sfu_url;
-            updateStatus(`Joined room ${roomId}, connecting to SFU...`);
-            await connectToSFU(sfuUrl);
-        } else if (msg.type === 'participant_joined') {
-            updateStatus(`Participant ${msg.participant.name} joined`);
-        } else if (msg.type === 'participant_left') {
-            updateStatus(`Participant ${msg.participant_id} left`);
-        } else if (msg.type === 'error') {
-            console.error('Signaling error:', msg.message);
-            updateStatus(`Error: ${msg.message}`);
+        switch (msg.type) {
+            case 'joined':
+                participantId = msg.participant_id;
+                const sfuUrl = msg.sfu_url;
+                updateStatus(`Joined room ${roomId}, connecting to SFU...`);
+                await connectToSFU(sfuUrl);
+                break;
+
+            case 'participant_joined':
+                updateStatus(`Participant ${msg.participant.name} joined`);
+                break;
+
+            case 'participant_left':
+                updateStatus(`Participant ${msg.participant_id} left`);
+                break;
+
+            case 'pong':
+                const rtt = Date.now() - msg.timestamp;
+                latencyResultDiv.innerHTML = `<p>✅ RTT через WebSocket: ${rtt} мс</p>`;
+                console.log(`[PONG] RTT = ${rtt} мс`);
+                break;
+
+            case 'error':
+                console.error('Signaling error:', msg.message);
+                updateStatus(`Error: ${msg.message}`);
+                break;
+
+            default:
+                console.warn('Unknown signaling message type:', msg.type);
         }
     };
 
@@ -107,6 +231,7 @@ async function joinRoom() {
         updateStatus('Signaling connection closed');
         joinBtn.disabled = false;
         leaveBtn.disabled = true;
+        webrtcStatsDiv.innerHTML = '<pre>Соединение с сигнальным сервером закрыто</pre>';
     };
 }
 
@@ -193,9 +318,11 @@ async function connectToSFU(sfuUrl) {
 
 async function setupSFUPeerConnection() {
     sfuPeerConnection = new RTCPeerConnection(pcConfig);
+
+    // Опционально: предпочтение кодека VP8
     const transceivers = sfuPeerConnection.getTransceivers();
     for (const transceiver of transceivers) {
-        if (transceiver.receiver.track.kind === 'video') {
+        if (transceiver.receiver && transceiver.receiver.track && transceiver.receiver.track.kind === 'video') {
             const codecs = RTCRtpReceiver.getCapabilities('video').codecs;
             const vp8 = codecs.find(c => c.mimeType === 'video/VP8');
             if (vp8) {
@@ -203,6 +330,7 @@ async function setupSFUPeerConnection() {
             }
         }
     }
+
     sfuPeerConnection.onicecandidate = (event) => {
         if (event.candidate && sfuSocket && sfuSocket.readyState === WebSocket.OPEN) {
             sfuSocket.send(JSON.stringify({
@@ -214,20 +342,17 @@ async function setupSFUPeerConnection() {
 
     sfuPeerConnection.ontrack = (event) => {
         console.log('Remote track received:', event.track.kind, 'streams:', event.streams);
-        console.log('ontrack:', event.track.kind, event.streams[0]?.id);
         const stream = event.streams[0];
         if (!stream) {
             console.warn('No stream associated with track');
             return;
         }
 
-        // Если для этого потока уже есть видеоэлемент – ничего не создаём
         if (remoteVideoElements.has(stream.id)) {
             console.log(`Stream ${stream.id} already exists, track added automatically`);
             return;
         }
 
-        // Создаём новый видеоэлемент и контейнер
         const video = document.createElement('video');
         video.srcObject = stream;
         video.autoplay = true;
@@ -239,9 +364,8 @@ async function setupSFUPeerConnection() {
 
         const labelDiv = document.createElement('div');
         labelDiv.className = 'label';
-        // Из stream.id можно извлечь participant_id (сервер задаёт "remote-<participant_id>")
-        const participantId = stream.id.replace('remote-', '');
-        labelDiv.textContent = `Remote (${participantId.slice(0, 8)})`;
+        const remoteParticipantId = stream.id.replace('remote-', '');
+        labelDiv.textContent = `Remote (${remoteParticipantId.slice(0, 8)})`;
 
         container.appendChild(video);
         container.appendChild(labelDiv);
@@ -252,14 +376,9 @@ async function setupSFUPeerConnection() {
 
     sfuPeerConnection.onconnectionstatechange = () => {
         updateStatus(`SFU connection state: ${sfuPeerConnection.connectionState}`);
-    };
-
-    sfuPeerConnection.onicecandidate = (event) => {
-        if (event.candidate && event.candidate.candidate && event.candidate.candidate.trim() !== "") {
-            sfuSocket.send(JSON.stringify({
-                type: 'ice-candidate',
-                candidate: event.candidate
-            }));
+        // При разрыве очищаем статистику
+        if (sfuPeerConnection.connectionState === 'disconnected' || sfuPeerConnection.connectionState === 'failed') {
+            webrtcStatsDiv.innerHTML = '<pre>Соединение с SFU потеряно</pre>';
         }
     };
 
@@ -333,11 +452,13 @@ function cleanup() {
         if (container) container.remove();
     });
     remoteVideoElements.clear();
+    prevStatsMap.clear();
+    webrtcStatsDiv.innerHTML = '<pre>Соединение закрыто</pre>';
 }
 
 function leaveRoom() {
     if (signalingSocket) {
-        signalingSocket.send(JSON.stringify({type: 'leave'}));
+        signalingSocket.send(JSON.stringify({ type: 'leave' }));
         signalingSocket.close();
         signalingSocket = null;
     }
