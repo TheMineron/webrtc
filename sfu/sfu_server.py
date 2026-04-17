@@ -49,7 +49,10 @@ class Room:
     async def broadcast_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
         for pid, participant in self.participants.items():
             if pid != sender_id:
-                await participant.add_or_replace_track(sender_id, track, replace_existing)
+                try:
+                    await participant.add_or_replace_track(sender_id, track, replace_existing)
+                except Exception as e:
+                    logger.error(f"Failed to add track to {pid}: {e}", exc_info=True)
 
     async def send_existing_tracks_to_newcomer(self, newcomer_id: str) -> None:
         newcomer = self.participants.get(newcomer_id)
@@ -84,13 +87,16 @@ class Participant:
     def _setup_peer_connection_handlers(self) -> None:
         @self.peer_connection.on("track")
         async def on_track(track):
-            logger.info(f"Track received from {self.id}: {track.kind}")
-            self.local_tracks.add(track)
-            await self.room.broadcast_track(self.id, track)
+            try:
+                logger.info(f"Track received from {self.id}: {track.kind}")
+                self.local_tracks.add(track)
+                await self.room.broadcast_track(self.id, track)
 
-            @track.on("ended")
-            def on_ended():
-                self.local_tracks.discard(track)
+                @track.on("ended")
+                def on_ended():
+                    self.local_tracks.discard(track)
+            except Exception as e:
+                logger.error(f"Error in on_track for {self.id}: {e}", exc_info=True)
 
         @self.peer_connection.on("connectionstatechange")
         async def on_connectionstatechange():
@@ -124,6 +130,7 @@ class Participant:
             await self.notify_renegotiation_needed()
 
     async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
+
         async with self._lock:
             if self.peer_connection.signalingState != "stable":
                 logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
@@ -137,8 +144,23 @@ class Participant:
             existing_sender = senders.get(track.kind)
 
             if replace_existing and existing_sender:
+                # Дополнительная проверка перед replaceTrack
+                if self.peer_connection.signalingState != "stable":
+                    logger.info(
+                        f"Deferring replace track for {sender_id} ({track.kind}) – state {self.peer_connection.signalingState}")
+                    self.pending_tracks.append((sender_id, track, replace_existing))
+                    return
+
                 logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
-                await existing_sender.replaceTrack(track)
+                try:
+                    await existing_sender.replaceTrack(track)  # replaceTrack может быть корутиной?
+                except Exception as e:
+                    logger.error(f"Failed to replace track: {e}")
+                    # Если замена не удалась, пробуем добавить как новый
+                    sender = self.peer_connection.addTrack(track)
+                    if sender:
+                        senders[track.kind] = sender
+                        await self.notify_renegotiation_needed()
                 return
 
             if not replace_existing and existing_sender:
