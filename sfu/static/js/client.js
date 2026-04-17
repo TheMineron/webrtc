@@ -24,6 +24,8 @@ let participantId = '';
 let nickname = '';
 let renegotiationInProgress = false;
 const remoteVideoElements = new Map(); // key = stream.id, value = video element
+let renegotiateNeeded = false;
+let renegotiateRunning = false;
 
 // --- E2E тест переменные ---
 let e2eTestInProgress = false;
@@ -183,6 +185,38 @@ function startE2eVideoLatencyTest() {
             }
         }, 10000);
     }, 500);
+}
+
+async function processRenegotiation() {
+    if (renegotiateRunning) return;
+    if (!renegotiateNeeded) return;
+    if (!sfuPeerConnection) return;
+    if (sfuPeerConnection.signalingState !== 'stable') return;
+
+    renegotiateRunning = true;
+    renegotiateNeeded = false;
+
+    try {
+        console.log('[SFU] Starting renegotiation');
+
+        const offer = await sfuPeerConnection.createOffer();
+        await sfuPeerConnection.setLocalDescription(offer);
+
+        sfuSocket.send(JSON.stringify({
+            type: 'offer',
+            sdp: offer.sdp
+        }));
+
+    } catch (err) {
+        console.error('[SFU] Renegotiation failed:', err);
+    } finally {
+        renegotiateRunning = false;
+
+        // 🔥 если пока мы делали offer пришёл новый renegotiate
+        if (renegotiateNeeded) {
+            setTimeout(processRenegotiation, 0);
+        }
+    }
 }
 
 // --- Приёмник E2E теста (использует первый попавшийся удалённый видеоэлемент) ---
@@ -629,40 +663,8 @@ async function connectToSFU(sfuUrl) {
             if (msg.type === 'joined') {
                 updateStatus('Joined SFU room');
             } else if (msg.type === 'renegotiate') {
-                if (!sfuPeerConnection || renegotiationInProgress) return;
-                renegotiationInProgress = true;
-                try {
-                    const offer = await sfuPeerConnection.createOffer();
-                    await sfuPeerConnection.setLocalDescription(offer);
-                    sfuSocket.send(JSON.stringify({
-                        type: 'offer',
-                        sdp: offer.sdp
-                    }));
-                    updateStatus('Sent renegotiation offer');
-                } catch (err) {
-                    console.error('Failed to create renegotiation offer:', err);
-                    renegotiationInProgress = false;
-                }
-            } else if (msg.type === 'offer') {
-                if (!sfuPeerConnection || renegotiationInProgress) return;
-                renegotiationInProgress = true;
-                try {
-                    await sfuPeerConnection.setRemoteDescription(new RTCSessionDescription({
-                        type: 'offer',
-                        sdp: msg.sdp
-                    }));
-                    const answer = await sfuPeerConnection.createAnswer();
-                    await sfuPeerConnection.setLocalDescription(answer);
-                    sfuSocket.send(JSON.stringify({
-                        type: 'answer',
-                        sdp: answer.sdp
-                    }));
-                    updateStatus('Answer sent to SFU');
-                } catch (err) {
-                    console.error('Failed to handle offer:', err);
-                } finally {
-                    renegotiationInProgress = false;
-                }
+                renegotiateNeeded = true;
+                await processRenegotiation();
             } else if (msg.type === 'answer') {
                 try {
                     const answer = new RTCSessionDescription({
@@ -670,6 +672,7 @@ async function connectToSFU(sfuUrl) {
                         sdp: msg.sdp
                     });
                     await sfuPeerConnection.setRemoteDescription(answer);
+                    processRenegotiation();
                     updateStatus('WebRTC connection established');
                 } catch (err) {
                     console.error('Failed to set remote description:', err);
@@ -723,35 +726,32 @@ async function setupSFUPeerConnection() {
         }
     };
 
-    sfuPeerConnection.ontrack = (event) => {
-        console.log('Remote track received:', event.track.kind);
-        const stream = event.streams[0];
-        if (!stream) return;
+    sfuPeerConnection.onsignalingstatechange = () => {
+        console.log('[SFU] signalingState:', sfuPeerConnection.signalingState);
 
-        if (event.track.kind === 'video' && !firstVideoFrameTime && callStartTime) {
-            firstVideoFrameTime = performance.now();
-            const setupTime = firstVideoFrameTime - callStartTime;
-            console.log(`[METRIC] Call Setup Time = ${setupTime.toFixed(2)} ms`);
+        if (sfuPeerConnection.signalingState === 'stable') {
+            processRenegotiation();
         }
+    };
 
+    sfuPeerConnection.ontrack = (event) => {
+        console.log('Remote track:', event.track.kind);
+        let stream;
+        if (event.streams && event.streams[0]) {
+            stream = event.streams[0];
+        } else {
+            stream = new MediaStream([event.track]);
+        }
         if (remoteVideoElements.has(stream.id)) return;
-
         const video = document.createElement('video');
         video.srcObject = stream;
         video.autoplay = true;
         video.playsInline = true;
-
         const container = document.createElement('div');
         container.className = 'video-container';
-        container.id = `video-${stream.id}`;
-        const labelDiv = document.createElement('div');
-        labelDiv.className = 'label';
-        labelDiv.textContent = `Remote (${stream.id.slice(0, 8)})`;
         container.appendChild(video);
-        container.appendChild(labelDiv);
         videosContainer.appendChild(container);
         remoteVideoElements.set(stream.id, video);
-        console.log('[E2E] Добавлен удалённый видеоэлемент, всего:', remoteVideoElements.size);
     };
 
     sfuPeerConnection.onconnectionstatechange = () => {
