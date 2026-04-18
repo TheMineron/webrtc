@@ -74,11 +74,13 @@ class Room:
                 f"  from participant {pid}, local_tracks: {[t.kind for t in participant.local_tracks]}")
             for track in participant.local_tracks:
                 relayed_track = relay.subscribe(track)
+                relayed_track = relay.subscribe(track)
                 if relayed_track is None:
                     logger.error(f"Failed to subscribe to {track.kind} from {pid}")
                     continue
-                logger.info(f"    subscribing to {track.kind} track from {pid}")
-                await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=True)
+                logger.info(
+                    f"Subscribed to {track.kind} from {pid}, relayed_track.readyState={relayed_track.readyState}")
+                await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=False)
 
     def __str__(self) -> str:
         return self.id
