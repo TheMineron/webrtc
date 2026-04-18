@@ -736,13 +736,8 @@ async function setupSFUPeerConnection() {
 
     sfuPeerConnection.ontrack = (event) => {
         console.log('Remote track:', event.track.kind);
-        let stream;
-        if (event.streams && event.streams[0]) {
-            stream = event.streams[0];
-        } else {
-            stream = new MediaStream([event.track]);
-        }
-        if (remoteVideoElements.has(stream.id)) return;
+        // Создаём отдельный поток для каждого трека
+        const stream = new MediaStream([event.track]);
         const video = document.createElement('video');
         video.srcObject = stream;
         video.autoplay = true;
@@ -751,7 +746,16 @@ async function setupSFUPeerConnection() {
         container.className = 'video-container';
         container.appendChild(video);
         videosContainer.appendChild(container);
-        remoteVideoElements.set(stream.id, video);
+        remoteVideoElements.set(event.track.id, video);
+
+        event.track.onended = () => {
+            console.log('Remote track ended:', event.track.kind);
+            const vid = remoteVideoElements.get(event.track.id);
+            if (vid) {
+                vid.parentNode.remove();
+                remoteVideoElements.delete(event.track.id);
+            }
+        };
     };
 
     sfuPeerConnection.onconnectionstatechange = () => {

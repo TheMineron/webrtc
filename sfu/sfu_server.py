@@ -74,6 +74,9 @@ class Room:
                 f"  from participant {pid}, local_tracks: {[t.kind for t in participant.local_tracks]}")
             for track in participant.local_tracks:
                 relayed_track = relay.subscribe(track)
+                if relayed_track is None:
+                    logger.error(f"Failed to subscribe to {track.kind} from {pid}")
+                    continue
                 logger.info(f"    subscribing to {track.kind} track from {pid}")
                 await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=False)
 
@@ -183,6 +186,20 @@ class Participant:
             logger.warning(
                 f"Track {track.kind} from {sender_id} already exists, skipping (replace_existing=False)")
             return
+
+        for transceiver in self.peer_connection.getTransceivers():
+            logger.info(f"transceiver: {transceiver.kind=} "
+                        f"{transceiver.direction=} "
+                        f"{transceiver.mid=}"
+                        f"{transceiver.sender=}"
+                        f"{transceiver.receiver=}")
+            if transceiver.sender.track is None and transceiver.direction in (
+            'sendonly', 'sendrecv'):
+                # Можно использовать этот трансивер
+                break
+        else:
+            logger.info("Создается новый трансивер")
+            self.peer_connection.addTransceiver(track.kind, direction='sendonly')
 
         # Новый трек – используем addTrack
         logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
@@ -340,6 +357,7 @@ async def handle_client(websocket) -> None:
                     continue
 
                 answer = RTCSessionDescription(sdp=data["sdp"], type="answer")
+                logger.info(f"SDP answer for {participant.id}:\n{answer.sdp}")
                 await participant.peer_connection.setRemoteDescription(answer)
                 participant._renegotiation_pending = False
                 logger.info(f"Received answer for {participant.id}")
