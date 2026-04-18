@@ -10,6 +10,7 @@ from aiortc.contrib.media import MediaRelay
 
 import aiortc.rtcpeerconnection
 
+# Monkey patch для исправления проблемы с direction при None
 original_and_direction = aiortc.rtcpeerconnection.and_direction
 
 
@@ -78,7 +79,9 @@ class Room:
                     logger.error(f"Failed to subscribe to {track.kind} from {pid}")
                     continue
                 logger.info(f"    subscribing to {track.kind} track from {pid}")
-                await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=False)
+                # ИСПРАВЛЕНИЕ: заменяем replace_existing=False на True
+                # чтобы гарантировать получение трека даже если он уже есть в remote_senders
+                await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=True)
 
     def __str__(self) -> str:
         return self.id
@@ -164,6 +167,9 @@ class Participant:
             f"add_or_replace_track({self.id}, sender={sender_id}, kind={track.kind}, replace={replace_existing})")
         logger.info(f"  current signalingState={self.peer_connection.signalingState}")
 
+        # Улучшенное логирование: показываем текущее состояние remote_senders
+        logger.info(f"  remote_senders before: {self.remote_senders}")
+
         if self.peer_connection.signalingState != "stable":
             logger.info(
                 f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
@@ -187,6 +193,7 @@ class Participant:
                 f"Track {track.kind} from {sender_id} already exists, skipping (replace_existing=False)")
             return
 
+        # Проверяем, можно ли использовать существующий трансивер с direction sendonly/sendrecv и без трека
         for transceiver in self.peer_connection.getTransceivers():
             logger.info(f"transceiver: {transceiver.kind=} "
                         f"{transceiver.direction=} "
@@ -209,6 +216,7 @@ class Participant:
             return
         senders[track.kind] = sender
         logger.info(f"remote_senders[{sender_id}] now: {list(senders.keys())}")
+        logger.info(f"  remote_senders after: {self.remote_senders}")
         await self.notify_renegotiation_needed()
 
     async def notify_renegotiation_needed(self) -> None:
