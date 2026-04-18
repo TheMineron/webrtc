@@ -672,7 +672,7 @@ async function connectToSFU(sfuUrl) {
                         sdp: msg.sdp
                     });
                     await sfuPeerConnection.setRemoteDescription(answer);
-                    processRenegotiation();
+                    await processRenegotiation();
                     updateStatus('WebRTC connection established');
                 } catch (err) {
                     console.error('Failed to set remote description:', err);
