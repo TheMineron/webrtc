@@ -1,12 +1,12 @@
-const signalingUrl = 'wss://130.193.46.12:8000/ws';
+const signalingUrl = 'wss://81.26.180.66:8000/ws';
 const pcConfig = {
     iceServers: [
         {urls: 'stun:stun.l.google.com:19302'},
         {urls: 'stun:stun1.l.google.com:19302'},
         {
             urls: [
-                'turn:178.154.215.177:3478?transport=udp',
-                'turn:178.154.215.177:3478?transport=tcp'
+                'turn:81.26.182.252:3478?transport=udp',
+                'turn:81.26.182.252:3478?transport=tcp'
             ],
             username: 'webrtc',
             credential: 'webrtc_password'
