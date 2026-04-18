@@ -735,26 +735,22 @@ async function setupSFUPeerConnection() {
     };
 
     sfuPeerConnection.ontrack = (event) => {
-        console.log('Remote track:', event.track.kind);
-        const stream = new MediaStream([event.track]);
-        const video = document.createElement('video');
-        video.srcObject = stream;
-        video.autoplay = true;
-        video.playsInline = true;
-        const container = document.createElement('div');
-        container.className = 'video-container';
-        container.appendChild(video);
-        videosContainer.appendChild(container);
-        remoteVideoElements.set(event.track.id, video);
-
-        event.track.onended = () => {
-            console.log('Remote track ended:', event.track.kind);
-            const vid = remoteVideoElements.get(event.track.id);
-            if (vid) {
-                vid.parentNode.remove();
-                remoteVideoElements.delete(event.track.id);
-            }
-        };
+        console.log('Remote track received:', event.track.kind, 'Stream id:', event.streams[0]?.id);
+        const stream = event.streams[0] || new MediaStream([event.track]);
+        // Группируем треки по stream.id, чтобы не плодить лишние видеоэлементы
+        let videoElement = remoteVideoElements.get(stream.id);
+        if (!videoElement) {
+            videoElement = document.createElement('video');
+            videoElement.srcObject = stream;
+            videoElement.autoplay = true;
+            videoElement.playsInline = true;
+            const container = document.createElement('div');
+            container.className = 'video-container';
+            container.appendChild(videoElement);
+            videosContainer.appendChild(container);
+            remoteVideoElements.set(stream.id, videoElement);
+        }
+        // Если трек видео, то он уже есть в потоке, дополнительных действий не требуется
     };
 
     sfuPeerConnection.onconnectionstatechange = () => {

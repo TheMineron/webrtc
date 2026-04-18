@@ -13,19 +13,16 @@ import aiortc.rtcpeerconnection
 # Monkey patch для исправления проблемы с direction при None
 original_and_direction = aiortc.rtcpeerconnection.and_direction
 
-
 def patched_and_direction(a, b):
     if a is None or b is None:
         return 'inactive'
     return original_and_direction(a, b)
 
-
 aiortc.rtcpeerconnection.and_direction = patched_and_direction
-
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %name)s - %levelname)s - %message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -71,17 +68,20 @@ class Room:
         for pid, participant in self.participants.items():
             if pid == newcomer_id:
                 continue
-            logger.info(
-                f"  from participant {pid}, local_tracks: {[t.kind for t in participant.local_tracks]}")
+            logger.info(f"  from participant {pid}, local_tracks: {[t.kind for t in participant.local_tracks]}")
             for track in participant.local_tracks:
                 relayed_track = relay.subscribe(track)
                 if relayed_track is None:
                     logger.error(f"Failed to subscribe to {track.kind} from {pid}")
                     continue
                 logger.info(f"    subscribing to {track.kind} track from {pid}")
-                # ИСПРАВЛЕНИЕ: заменяем replace_existing=False на True
-                # чтобы гарантировать получение трека даже если он уже есть в remote_senders
                 await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=True)
+
+    async def notify_all_except(self, exclude_id: str) -> None:
+        """Принудительно посылает renegotiate всем участникам, кроме указанного."""
+        for pid, participant in self.participants.items():
+            if pid != exclude_id:
+                await participant.notify_renegotiation_needed()
 
     def __str__(self) -> str:
         return self.id
@@ -105,8 +105,7 @@ class Participant:
         async def on_track(track):
             logger.info(f"Track received from {self.id}: {track.kind}")
             self.local_tracks.add(track)
-            logger.info(
-                f"Participant {self.id} local_tracks now: {[t.kind for t in self.local_tracks]}")
+            logger.info(f"Participant {self.id} local_tracks now: {[t.kind for t in self.local_tracks]}")
             await self.room.broadcast_track(self.id, track)
 
             @track.on("ended")
@@ -141,6 +140,9 @@ class Participant:
                 self.pending_tracks.clear()
                 for sender_id, track, replace_existing in pending:
                     await self.add_or_replace_track(sender_id, track, replace_existing)
+                # После обработки всех отложенных треков уведомляем клиента о необходимости renegotiation
+                if pending:
+                    await self.notify_renegotiation_needed()
 
         @self.peer_connection.on("icecandidate")
         async def on_icecandidate(candidate):
@@ -161,18 +163,13 @@ class Participant:
             else:
                 logger.info(f"ICE candidate gathering complete for {self.id}")
 
-    async def add_or_replace_track(self, sender_id: str, track,
-                                   replace_existing: bool = True) -> None:
-        logger.info(
-            f"add_or_replace_track({self.id}, sender={sender_id}, kind={track.kind}, replace={replace_existing})")
+    async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
+        logger.info(f"add_or_replace_track({self.id}, sender={sender_id}, kind={track.kind}, replace={replace_existing})")
         logger.info(f"  current signalingState={self.peer_connection.signalingState}")
-
-        # Улучшенное логирование: показываем текущее состояние remote_senders
         logger.info(f"  remote_senders before: {self.remote_senders}")
 
         if self.peer_connection.signalingState != "stable":
-            logger.info(
-                f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
+            logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
             self.pending_tracks.append((sender_id, track, replace_existing))
             return
 
@@ -186,29 +183,23 @@ class Participant:
         if replace_existing and existing_sender:
             logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
             await existing_sender.replaceTrack(track)
+            # После замены трека уведомляем о необходимости renegotiation
+            await self.notify_renegotiation_needed()
             return
 
         if not replace_existing and existing_sender:
-            logger.warning(
-                f"Track {track.kind} from {sender_id} already exists, skipping (replace_existing=False)")
+            logger.warning(f"Track {track.kind} from {sender_id} already exists, skipping (replace_existing=False)")
             return
 
-        # Проверяем, можно ли использовать существующий трансивер с direction sendonly/sendrecv и без трека
+        # Поиск подходящего трансивера
         for transceiver in self.peer_connection.getTransceivers():
-            logger.info(f"transceiver: {transceiver.kind=} "
-                        f"{transceiver.direction=} "
-                        f"{transceiver.mid=}"
-                        f"{transceiver.sender=}"
-                        f"{transceiver.receiver=}")
-            if transceiver.sender.track is None and transceiver.direction in (
-            'sendonly', 'sendrecv'):
-                # Можно использовать этот трансивер
+            if transceiver.sender.track is None and transceiver.direction in ('sendonly', 'sendrecv'):
+                logger.info(f"Reusing existing transceiver for {track.kind}")
                 break
         else:
-            logger.info("Создается новый трансивер")
+            logger.info("Creating new transceiver")
             self.peer_connection.addTransceiver(track.kind, direction='sendonly')
 
-        # Новый трек – используем addTrack
         logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
         sender = self.peer_connection.addTrack(track)
         if sender is None:
@@ -217,6 +208,11 @@ class Participant:
         senders[track.kind] = sender
         logger.info(f"remote_senders[{sender_id}] now: {list(senders.keys())}")
         logger.info(f"  remote_senders after: {self.remote_senders}")
+
+        # Логируем все трансиверы после добавления
+        transceivers = self.peer_connection.getTransceivers()
+        logger.info(f"  Transceivers after add: {[(t.kind, t.direction, t.mid) for t in transceivers]}")
+
         await self.notify_renegotiation_needed()
 
     async def notify_renegotiation_needed(self) -> None:
@@ -314,8 +310,7 @@ async def handle_client(websocket) -> None:
                 room_id = data.get("room")
                 participant_id = data.get("participant_id")
                 if not room_id or not participant_id:
-                    await websocket.send(json.dumps(
-                        {"type": "error", "message": "room and participant_id required"}))
+                    await websocket.send(json.dumps({"type": "error", "message": "room and participant_id required"}))
                     continue
 
                 room = room_manager.get_or_create(room_id)
@@ -332,15 +327,15 @@ async def handle_client(websocket) -> None:
                 logger.info(f"Received offer from {participant.id}")
                 offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
                 await participant.peer_connection.setRemoteDescription(offer)
-                logger.info(
-                    f"After setRemoteDescription, signalingState={participant.peer_connection.signalingState}")
+                logger.info(f"After setRemoteDescription, signalingState={participant.peer_connection.signalingState}")
 
                 if not participant._tracks_initialized:
                     logger.info(f"Initializing tracks for newcomer {participant.id}")
                     await room.send_existing_tracks_to_newcomer(participant.id)
                     participant._tracks_initialized = True
+                    # После отправки существующих треков уведомляем всех остальных о необходимости renegotiation
+                    await room.notify_all_except(participant.id)
 
-                # Всегда отвечаем на offer, если состояние "have-remote-offer"
                 if participant.peer_connection.signalingState == "have-remote-offer":
                     try:
                         answer = await participant.peer_connection.createAnswer()
@@ -356,8 +351,7 @@ async def handle_client(websocket) -> None:
                     finally:
                         participant._renegotiation_pending = False
                 else:
-                    logger.warning(
-                        f"Unexpected signaling state after setRemoteDescription: {participant.peer_connection.signalingState}")
+                    logger.warning(f"Unexpected signaling state after setRemoteDescription: {participant.peer_connection.signalingState}")
 
             elif msg_type == "answer":
                 if not participant:
@@ -393,8 +387,7 @@ async def handle_client(websocket) -> None:
                 break
 
             else:
-                await websocket.send(
-                    json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
+                await websocket.send(json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
 
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"WebSocket closed for {participant_id}")
