@@ -23,12 +23,11 @@ let roomId = '';
 let participantId = '';
 let nickname = '';
 let renegotiationInProgress = false;
-// Изменение: теперь ключ - streamId (строка), значение - видеоэлемент
-const remoteStreams = new Map(); // key = streamId (участник), value = { videoElement, audioTrack, videoTrack }
+const remoteStreams = new Map(); // key = streamId (например, participantId), value = { videoElement, stream }
 let renegotiateNeeded = false;
 let renegotiateRunning = false;
 
-// --- E2E тест переменные (без изменений) ---
+// --- E2E тест переменные ---
 let e2eTestInProgress = false;
 let e2eStartTime = null;
 let e2eRemoteMonitor = false;
@@ -37,7 +36,7 @@ let originalVideoTrack = null;
 let canvasStream = null;
 let lastE2eResult = null;
 
-// --- Метрики и статистика (без изменений) ---
+// --- Метрики и статистика ---
 let conferenceStartTime = null;
 let callStartTime = null;
 let firstVideoFrameTime = null;
@@ -97,7 +96,7 @@ function addVideoElement(stream, label, isLocal = false) {
     return video;
 }
 
-// --- E2E тест (без изменений) ---
+// --- E2E тест: вспышка цветом ---
 async function flashColorOnStream(color, duration = 300) {
     if (!localStream) return;
     const videoTrack = localStream.getVideoTracks()[0];
@@ -223,7 +222,6 @@ async function processRenegotiation() {
     }
 }
 
-// --- Приёмник E2E теста (без изменений) ---
 function startE2eReceiver(senderId) {
     if (e2eRemoteMonitor) {
         console.log('[E2E] Уже в режиме мониторинга');
@@ -235,7 +233,6 @@ function startE2eReceiver(senderId) {
         console.warn('[E2E] Нет удалённых видеоэлементов');
         return;
     }
-    // Берём первый попавшийся видеоэлемент (любого участника)
     const videoElement = Array.from(remoteStreams.values())[0].videoElement;
     console.log('[E2E] Используем видеоэлемент:', videoElement);
 
@@ -284,7 +281,6 @@ function startE2eReceiver(senderId) {
     }, 50);
 }
 
-// --- WebSocket ping (без изменений) ---
 function sendPing() {
     if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
         const timestamp = Date.now();
@@ -298,7 +294,6 @@ function sendPing() {
     }
 }
 
-// --- Сбор статистики (без изменений) ---
 async function collectFullStats() {
     if (!sfuPeerConnection) {
         localStatsContent.innerText = '— нет соединения —';
@@ -504,7 +499,6 @@ async function collectFullStats() {
     }
 }
 
-// --- Обработка сигнальных сообщений (исправлен вызов processRenegotiation) ---
 async function joinRoom() {
     roomId = roomInput.value.trim();
     nickname = nameInput.value.trim();
@@ -669,7 +663,7 @@ async function connectToSFU(sfuUrl) {
             } else if (msg.type === 'renegotiate') {
                 console.log('[SFU] Received renegotiate, triggering renegotiation');
                 renegotiateNeeded = true;
-                await processRenegotiation(); // ИСПРАВЛЕНО: добавлен await
+                await processRenegotiation();
             } else if (msg.type === 'answer') {
                 try {
                     const answer = new RTCSessionDescription({
@@ -678,11 +672,9 @@ async function connectToSFU(sfuUrl) {
                     });
                     await sfuPeerConnection.setRemoteDescription(answer);
                     console.log('[SFU] Remote description set successfully');
-                    // После успешного ответа могут прийти новые треки через ontrack
+                    renegotiateRunning = false; // Сбрасываем флаг, так как renegotiation завершён
                 } catch (err) {
                     console.error('Failed to set remote description:', err);
-                } finally {
-                    renegotiationInProgress = false;
                 }
             } else if (msg.type === 'ice-candidate') {
                 try {
@@ -712,22 +704,13 @@ async function connectToSFU(sfuUrl) {
     }
 }
 
+// --- ИСПРАВЛЕНА функция setupSFUPeerConnection ---
 async function setupSFUPeerConnection() {
     sfuPeerConnection = new RTCPeerConnection(pcConfig);
 
-    // ОПЦИОНАЛЬНО: закомментируйте блок с предпочтением кодеков, если возникают проблемы
-    /*
-    const transceivers = sfuPeerConnection.getTransceivers();
-    for (const transceiver of transceivers) {
-        if (transceiver.receiver && transceiver.receiver.track && transceiver.receiver.track.kind === 'video') {
-            const codecs = RTCRtpReceiver.getCapabilities('video').codecs;
-            const vp8 = codecs.find(c => c.mimeType === 'video/VP8');
-            if (vp8) {
-                await transceiver.setCodecPreferences([vp8]);
-            }
-        }
-    }
-    */
+    // FIXED: Явно создаём трансиверы для аудио и видео, чтобы они были готовы принимать входящие треки
+    sfuPeerConnection.addTransceiver('audio', { direction: 'sendrecv' });
+    sfuPeerConnection.addTransceiver('video', { direction: 'sendrecv' });
 
     sfuPeerConnection.onicecandidate = (event) => {
         if (event.candidate && sfuSocket && sfuSocket.readyState === WebSocket.OPEN) {
@@ -741,69 +724,47 @@ async function setupSFUPeerConnection() {
     sfuPeerConnection.onsignalingstatechange = () => {
         console.log('[SFU] signalingState:', sfuPeerConnection.signalingState);
         if (sfuPeerConnection.signalingState === 'stable') {
-            // Если есть потребность в renegotiation, запускаем
             if (renegotiateNeeded) {
                 processRenegotiation();
             }
         }
     };
 
-    // ИСПРАВЛЕНА обработка ontrack: группируем треки по streamId (участнику)
+    // FIXED: Улучшенный ontrack – группируем треки одного участника в один MediaStream и один видеоэлемент
     sfuPeerConnection.ontrack = (event) => {
-        console.log('[SFU] ontrack:', event.track.kind, 'track.id=', event.track.id, 'streams=', event.streams);
-
-        // Определяем идентификатор потока. Если event.streams[0] существует, используем его id,
-        // иначе генерируем свой на основе track.id (обрезая часть после первого дефиса, если нужно).
-        let streamId;
+        console.log('[SFU] ontrack:', event.track.kind, 'streams:', event.streams);
+        // Определяем идентификатор потока. Если SFU прислал поток, используем его id, иначе генерируем на основе track.id
+        let stream;
         if (event.streams && event.streams.length > 0) {
-            streamId = event.streams[0].id;
+            stream = event.streams[0];
         } else {
-            // Если SFU не прислал поток, создаём фиктивный ID на основе track.id (отбрасываем случайную часть)
-            // Например, track.id = "abcdef-1234-video" -> "abcdef"
-            streamId = event.track.id.split('-')[0];
+            // Создаём новый поток для этого трека
+            stream = new MediaStream();
         }
-
+        const streamId = stream.id;
         let streamInfo = remoteStreams.get(streamId);
         if (!streamInfo) {
-            // Создаём новый MediaStream для этого участника
-            const newStream = new MediaStream();
+            // Создаём новый видеоэлемент для этого потока
             const videoElement = document.createElement('video');
-            videoElement.srcObject = newStream;
+            videoElement.srcObject = stream;
             videoElement.autoplay = true;
             videoElement.playsInline = true;
             const container = document.createElement('div');
             container.className = 'video-container';
             container.appendChild(videoElement);
             videosContainer.appendChild(container);
-
-            streamInfo = {
-                stream: newStream,
-                videoElement: videoElement,
-                hasVideo: false,
-                hasAudio: false
-            };
+            streamInfo = { videoElement, stream };
             remoteStreams.set(streamId, streamInfo);
-            console.log(`[SFU] Created new stream ${streamId} for participant`);
+            console.log(`[SFU] Created new video element for stream ${streamId}`);
         }
-
-        // Добавляем трек в общий поток
-        streamInfo.stream.addTrack(event.track);
-        if (event.track.kind === 'video') {
-            streamInfo.hasVideo = true;
-            // При первом видео можно установить метку времени
-            if (!firstVideoFrameTime && !streamInfo.hasVideo) {
-                firstVideoFrameTime = performance.now();
-            }
-        } else if (event.track.kind === 'audio') {
-            streamInfo.hasAudio = true;
+        // Добавляем трек в поток, если его там ещё нет
+        if (!stream.getTracks().includes(event.track)) {
+            stream.addTrack(event.track);
+            console.log(`[SFU] Added ${event.track.kind} track to stream ${streamId}`);
         }
-
-        // Если это видеотрек и видеоэлемент уже показывает поток, он автоматически обновится
-        console.log(`[SFU] Added ${event.track.kind} track to stream ${streamId}`);
-
         event.track.onended = () => {
             console.log(`[SFU] Track ended: ${event.track.kind} for stream ${streamId}`);
-            // Не удаляем сразу поток, может прийти замена
+            // Можно удалить поток, если все треки ended, но оставим для простоты
         };
     };
 
