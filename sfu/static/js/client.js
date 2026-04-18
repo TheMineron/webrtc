@@ -709,8 +709,8 @@ async function setupSFUPeerConnection() {
     sfuPeerConnection = new RTCPeerConnection(pcConfig);
 
     // FIXED: Явно создаём трансиверы для аудио и видео, чтобы они были готовы принимать входящие треки
-    sfuPeerConnection.addTransceiver('audio', { direction: 'sendrecv' });
-    sfuPeerConnection.addTransceiver('video', { direction: 'sendrecv' });
+    sfuPeerConnection.addTransceiver('audio', {direction: 'sendrecv'});
+    sfuPeerConnection.addTransceiver('video', {direction: 'sendrecv'});
 
     sfuPeerConnection.onicecandidate = (event) => {
         if (event.candidate && sfuSocket && sfuSocket.readyState === WebSocket.OPEN) {
@@ -721,30 +721,19 @@ async function setupSFUPeerConnection() {
         }
     };
 
-    sfuPeerConnection.onsignalingstatechange = () => {
+    sfuPeerConnection.onsignalingstatechange = async () => {
         console.log('[SFU] signalingState:', sfuPeerConnection.signalingState);
         if (sfuPeerConnection.signalingState === 'stable') {
             if (renegotiateNeeded) {
-                processRenegotiation();
+                await processRenegotiation();
             }
         }
     };
 
-    // FIXED: Улучшенный ontrack – группируем треки одного участника в один MediaStream и один видеоэлемент
     sfuPeerConnection.ontrack = (event) => {
-        console.log('[SFU] ontrack:', event.track.kind, 'streams:', event.streams);
-        // Определяем идентификатор потока. Если SFU прислал поток, используем его id, иначе генерируем на основе track.id
-        let stream;
-        if (event.streams && event.streams.length > 0) {
-            stream = event.streams[0];
-        } else {
-            // Создаём новый поток для этого трека
-            stream = new MediaStream();
-        }
-        const streamId = stream.id;
-        let streamInfo = remoteStreams.get(streamId);
-        if (!streamInfo) {
-            // Создаём новый видеоэлемент для этого потока
+        console.log('[SFU] ontrack:', event.track.kind, 'track.id=', event.track.id);
+        if (event.track.kind === 'video') {
+            const stream = new MediaStream([event.track]);
             const videoElement = document.createElement('video');
             videoElement.srcObject = stream;
             videoElement.autoplay = true;
@@ -753,19 +742,17 @@ async function setupSFUPeerConnection() {
             container.className = 'video-container';
             container.appendChild(videoElement);
             videosContainer.appendChild(container);
-            streamInfo = { videoElement, stream };
-            remoteStreams.set(streamId, streamInfo);
-            console.log(`[SFU] Created new video element for stream ${streamId}`);
+            remoteStreams.set(event.track.id, {videoElement, stream});
+        } else if (event.track.kind === 'audio') {
+            if (remoteStreams.size > 0) {
+                const first = remoteStreams.values().next().value;
+                first.stream.addTrack(event.track);
+            } else {
+                const audioElement = new Audio();
+                audioElement.srcObject = new MediaStream([event.track]);
+                audioElement.autoplay = true;
+            }
         }
-        // Добавляем трек в поток, если его там ещё нет
-        if (!stream.getTracks().includes(event.track)) {
-            stream.addTrack(event.track);
-            console.log(`[SFU] Added ${event.track.kind} track to stream ${streamId}`);
-        }
-        event.track.onended = () => {
-            console.log(`[SFU] Track ended: ${event.track.kind} for stream ${streamId}`);
-            // Можно удалить поток, если все треки ended, но оставим для простоты
-        };
     };
 
     sfuPeerConnection.onconnectionstatechange = () => {

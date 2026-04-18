@@ -163,13 +163,16 @@ class Participant:
             else:
                 logger.info(f"ICE candidate gathering complete for {self.id}")
 
-    async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
-        logger.info(f"add_or_replace_track({self.id}, sender={sender_id}, kind={track.kind}, replace={replace_existing})")
+    async def add_or_replace_track(self, sender_id: str, track,
+                                   replace_existing: bool = True) -> None:
+        logger.info(
+            f"add_or_replace_track({self.id}, sender={sender_id}, kind={track.kind}, replace={replace_existing})")
         logger.info(f"  current signalingState={self.peer_connection.signalingState}")
         logger.info(f"  remote_senders before: {self.remote_senders}")
 
         if self.peer_connection.signalingState != "stable":
-            logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
+            logger.info(
+                f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
             self.pending_tracks.append((sender_id, track, replace_existing))
             return
 
@@ -183,22 +186,16 @@ class Participant:
         if replace_existing and existing_sender:
             logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
             await existing_sender.replaceTrack(track)
-            # После замены трека уведомляем о необходимости renegotiation
             await self.notify_renegotiation_needed()
             return
 
         if not replace_existing and existing_sender:
-            logger.warning(f"Track {track.kind} from {sender_id} already exists, skipping (replace_existing=False)")
+            logger.warning(
+                f"Track {track.kind} from {sender_id} already exists, skipping (replace_existing=False)")
             return
 
-        # Поиск подходящего трансивера
-        for transceiver in self.peer_connection.getTransceivers():
-            if transceiver.sender.track is None and transceiver.direction in ('sendonly', 'sendrecv'):
-                logger.info(f"Reusing existing transceiver for {track.kind}")
-                break
-        else:
-            logger.info("Creating new transceiver")
-            self.peer_connection.addTransceiver(track.kind, direction='sendonly')
+        logger.info("Creating new transceiver")
+        self.peer_connection.addTransceiver(track.kind, direction='sendonly')
 
         logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
         sender = self.peer_connection.addTrack(track)
@@ -209,9 +206,9 @@ class Participant:
         logger.info(f"remote_senders[{sender_id}] now: {list(senders.keys())}")
         logger.info(f"  remote_senders after: {self.remote_senders}")
 
-        # Логируем все трансиверы после добавления
         transceivers = self.peer_connection.getTransceivers()
-        logger.info(f"  Transceivers after add: {[(t.kind, t.direction, t.mid) for t in transceivers]}")
+        logger.info(
+            f"  Transceivers after add: {[(t.kind, t.direction, t.mid) for t in transceivers]}")
 
         await self.notify_renegotiation_needed()
 
