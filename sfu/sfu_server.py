@@ -74,12 +74,10 @@ class Room:
                 f"  from participant {pid}, local_tracks: {[t.kind for t in participant.local_tracks]}")
             for track in participant.local_tracks:
                 relayed_track = relay.subscribe(track)
-                relayed_track = relay.subscribe(track)
                 if relayed_track is None:
                     logger.error(f"Failed to subscribe to {track.kind} from {pid}")
                     continue
-                logger.info(
-                    f"Subscribed to {track.kind} from {pid}, relayed_track.readyState={relayed_track.readyState}")
+                logger.info(f"    subscribing to {track.kind} track from {pid}")
                 await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=False)
 
     def __str__(self) -> str:
@@ -172,13 +170,11 @@ class Participant:
             self.pending_tracks.append((sender_id, track, replace_existing))
             return
 
-        logger.info(f"remote_senders before: {self.remote_senders}")
         if sender_id not in self.remote_senders:
             self.remote_senders[sender_id] = {}
             logger.info(f"Created remote_senders entry for {sender_id}")
 
         senders = self.remote_senders[sender_id]
-        logger.info(f"senders for {sender_id}: {senders}")
         existing_sender = senders.get(track.kind)
 
         if replace_existing and existing_sender:
