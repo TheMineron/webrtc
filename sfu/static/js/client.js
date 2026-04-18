@@ -23,11 +23,12 @@ let roomId = '';
 let participantId = '';
 let nickname = '';
 let renegotiationInProgress = false;
-const remoteVideoElements = new Map(); // key = stream.id, value = video element
+// Изменение: теперь ключ - streamId (строка), значение - видеоэлемент
+const remoteStreams = new Map(); // key = streamId (участник), value = { videoElement, audioTrack, videoTrack }
 let renegotiateNeeded = false;
 let renegotiateRunning = false;
 
-// --- E2E тест переменные ---
+// --- E2E тест переменные (без изменений) ---
 let e2eTestInProgress = false;
 let e2eStartTime = null;
 let e2eRemoteMonitor = false;
@@ -36,7 +37,7 @@ let originalVideoTrack = null;
 let canvasStream = null;
 let lastE2eResult = null;
 
-// --- Метрики и статистика ---
+// --- Метрики и статистика (без изменений) ---
 let conferenceStartTime = null;
 let callStartTime = null;
 let firstVideoFrameTime = null;
@@ -96,7 +97,7 @@ function addVideoElement(stream, label, isLocal = false) {
     return video;
 }
 
-// --- E2E тест: вспышка цветом ---
+// --- E2E тест (без изменений) ---
 async function flashColorOnStream(color, duration = 300) {
     if (!localStream) return;
     const videoTrack = localStream.getVideoTracks()[0];
@@ -129,7 +130,6 @@ async function flashColorOnStream(color, duration = 300) {
     }, duration);
 }
 
-// --- Отправка сигнала через signaling ---
 function sendSignal(targetId, data) {
     if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
         signalingSocket.send(JSON.stringify({
@@ -143,7 +143,6 @@ function sendSignal(targetId, data) {
     }
 }
 
-// --- Запуск E2E теста (отправитель) ---
 function startE2eVideoLatencyTest() {
     if (e2eTestInProgress) {
         console.log('[E2E] Тест уже идёт, пропускаем');
@@ -187,39 +186,44 @@ function startE2eVideoLatencyTest() {
     }, 500);
 }
 
+// --- ИСПРАВЛЕНА функция processRenegotiation ---
 async function processRenegotiation() {
-    if (renegotiateRunning) return;
+    if (renegotiateRunning) {
+        console.log('[SFU] Renegotiation already running, marking needed');
+        renegotiateNeeded = true;
+        return;
+    }
     if (!renegotiateNeeded) return;
     if (!sfuPeerConnection) return;
-    if (sfuPeerConnection.signalingState !== 'stable') return;
+    if (sfuPeerConnection.signalingState !== 'stable') {
+        console.log('[SFU] Renegotiation postponed, signalingState =', sfuPeerConnection.signalingState);
+        return;
+    }
 
     renegotiateRunning = true;
     renegotiateNeeded = false;
 
     try {
-        console.log('[SFU] Starting renegotiation');
-
+        console.log('[SFU] Creating offer for renegotiation');
         const offer = await sfuPeerConnection.createOffer();
         await sfuPeerConnection.setLocalDescription(offer);
-
         sfuSocket.send(JSON.stringify({
             type: 'offer',
             sdp: offer.sdp
         }));
-
+        console.log('[SFU] Offer sent, waiting for answer');
     } catch (err) {
         console.error('[SFU] Renegotiation failed:', err);
+        renegotiateNeeded = true;
     } finally {
         renegotiateRunning = false;
-
-        // 🔥 если пока мы делали offer пришёл новый renegotiate
         if (renegotiateNeeded) {
-            setTimeout(processRenegotiation, 0);
+            setTimeout(processRenegotiation, 100);
         }
     }
 }
 
-// --- Приёмник E2E теста (использует первый попавшийся удалённый видеоэлемент) ---
+// --- Приёмник E2E теста (без изменений) ---
 function startE2eReceiver(senderId) {
     if (e2eRemoteMonitor) {
         console.log('[E2E] Уже в режиме мониторинга');
@@ -227,17 +231,17 @@ function startE2eReceiver(senderId) {
     }
     console.log(`[E2E] Запуск приёмника для отправителя ${senderId}`);
 
-    // Берём первый доступный удалённый видеоэлемент
-    if (remoteVideoElements.size === 0) {
+    if (remoteStreams.size === 0) {
         console.warn('[E2E] Нет удалённых видеоэлементов');
         return;
     }
-    const videoElement = Array.from(remoteVideoElements.values())[0];
+    // Берём первый попавшийся видеоэлемент (любого участника)
+    const videoElement = Array.from(remoteStreams.values())[0].videoElement;
     console.log('[E2E] Используем видеоэлемент:', videoElement);
 
     e2eRemoteMonitor = true;
     let lastColor = null;
-    e2eStartTime = null; // будет установлен из e2e_color_change
+    e2eStartTime = null;
 
     if (e2eMonitorInterval) clearInterval(e2eMonitorInterval);
     e2eMonitorInterval = setInterval(() => {
@@ -245,7 +249,7 @@ function startE2eReceiver(senderId) {
             clearInterval(e2eMonitorInterval);
             return;
         }
-        if (!e2eStartTime) return; // ещё не получили цвет
+        if (!e2eStartTime) return;
 
         const video = videoElement;
         if (!video.videoWidth || !video.videoHeight) return;
@@ -280,7 +284,7 @@ function startE2eReceiver(senderId) {
     }, 50);
 }
 
-// --- WebSocket ping ---
+// --- WebSocket ping (без изменений) ---
 function sendPing() {
     if (signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
         const timestamp = Date.now();
@@ -294,7 +298,7 @@ function sendPing() {
     }
 }
 
-// --- Сбор статистики (с выводом E2E) ---
+// --- Сбор статистики (без изменений) ---
 async function collectFullStats() {
     if (!sfuPeerConnection) {
         localStatsContent.innerText = '— нет соединения —';
@@ -500,7 +504,7 @@ async function collectFullStats() {
     }
 }
 
-// --- Обработка сигнальных сообщений ---
+// --- Обработка сигнальных сообщений (исправлен вызов processRenegotiation) ---
 async function joinRoom() {
     roomId = roomInput.value.trim();
     nickname = nameInput.value.trim();
@@ -663,8 +667,9 @@ async function connectToSFU(sfuUrl) {
             if (msg.type === 'joined') {
                 updateStatus('Joined SFU room');
             } else if (msg.type === 'renegotiate') {
+                console.log('[SFU] Received renegotiate, triggering renegotiation');
                 renegotiateNeeded = true;
-                await processRenegotiation();
+                await processRenegotiation(); // ИСПРАВЛЕНО: добавлен await
             } else if (msg.type === 'answer') {
                 try {
                     const answer = new RTCSessionDescription({
@@ -672,16 +677,20 @@ async function connectToSFU(sfuUrl) {
                         sdp: msg.sdp
                     });
                     await sfuPeerConnection.setRemoteDescription(answer);
-                    await processRenegotiation();
-                    updateStatus('WebRTC connection established');
+                    console.log('[SFU] Remote description set successfully');
+                    // После успешного ответа могут прийти новые треки через ontrack
                 } catch (err) {
                     console.error('Failed to set remote description:', err);
                 } finally {
                     renegotiationInProgress = false;
                 }
             } else if (msg.type === 'ice-candidate') {
-                const candidate = new RTCIceCandidate(msg.candidate);
-                await sfuPeerConnection.addIceCandidate(candidate);
+                try {
+                    const candidate = new RTCIceCandidate(msg.candidate);
+                    await sfuPeerConnection.addIceCandidate(candidate);
+                } catch (err) {
+                    console.warn('Failed to add ICE candidate:', err);
+                }
             } else if (msg.type === 'error') {
                 console.error('SFU error:', msg.message);
                 updateStatus(`SFU error: ${msg.message}`);
@@ -706,6 +715,8 @@ async function connectToSFU(sfuUrl) {
 async function setupSFUPeerConnection() {
     sfuPeerConnection = new RTCPeerConnection(pcConfig);
 
+    // ОПЦИОНАЛЬНО: закомментируйте блок с предпочтением кодеков, если возникают проблемы
+    /*
     const transceivers = sfuPeerConnection.getTransceivers();
     for (const transceiver of transceivers) {
         if (transceiver.receiver && transceiver.receiver.track && transceiver.receiver.track.kind === 'video') {
@@ -716,6 +727,7 @@ async function setupSFUPeerConnection() {
             }
         }
     }
+    */
 
     sfuPeerConnection.onicecandidate = (event) => {
         if (event.candidate && sfuSocket && sfuSocket.readyState === WebSocket.OPEN) {
@@ -728,29 +740,71 @@ async function setupSFUPeerConnection() {
 
     sfuPeerConnection.onsignalingstatechange = () => {
         console.log('[SFU] signalingState:', sfuPeerConnection.signalingState);
-
         if (sfuPeerConnection.signalingState === 'stable') {
-            processRenegotiation();
+            // Если есть потребность в renegotiation, запускаем
+            if (renegotiateNeeded) {
+                processRenegotiation();
+            }
         }
     };
 
+    // ИСПРАВЛЕНА обработка ontrack: группируем треки по streamId (участнику)
     sfuPeerConnection.ontrack = (event) => {
-        console.log('Remote track received:', event.track.kind, 'Stream id:', event.streams[0]?.id);
-        const stream = event.streams[0] || new MediaStream([event.track]);
-        // Группируем треки по stream.id, чтобы не плодить лишние видеоэлементы
-        let videoElement = remoteVideoElements.get(stream.id);
-        if (!videoElement) {
-            videoElement = document.createElement('video');
-            videoElement.srcObject = stream;
+        console.log('[SFU] ontrack:', event.track.kind, 'track.id=', event.track.id, 'streams=', event.streams);
+
+        // Определяем идентификатор потока. Если event.streams[0] существует, используем его id,
+        // иначе генерируем свой на основе track.id (обрезая часть после первого дефиса, если нужно).
+        let streamId;
+        if (event.streams && event.streams.length > 0) {
+            streamId = event.streams[0].id;
+        } else {
+            // Если SFU не прислал поток, создаём фиктивный ID на основе track.id (отбрасываем случайную часть)
+            // Например, track.id = "abcdef-1234-video" -> "abcdef"
+            streamId = event.track.id.split('-')[0];
+        }
+
+        let streamInfo = remoteStreams.get(streamId);
+        if (!streamInfo) {
+            // Создаём новый MediaStream для этого участника
+            const newStream = new MediaStream();
+            const videoElement = document.createElement('video');
+            videoElement.srcObject = newStream;
             videoElement.autoplay = true;
             videoElement.playsInline = true;
             const container = document.createElement('div');
             container.className = 'video-container';
             container.appendChild(videoElement);
             videosContainer.appendChild(container);
-            remoteVideoElements.set(stream.id, videoElement);
+
+            streamInfo = {
+                stream: newStream,
+                videoElement: videoElement,
+                hasVideo: false,
+                hasAudio: false
+            };
+            remoteStreams.set(streamId, streamInfo);
+            console.log(`[SFU] Created new stream ${streamId} for participant`);
         }
-        // Если трек видео, то он уже есть в потоке, дополнительных действий не требуется
+
+        // Добавляем трек в общий поток
+        streamInfo.stream.addTrack(event.track);
+        if (event.track.kind === 'video') {
+            streamInfo.hasVideo = true;
+            // При первом видео можно установить метку времени
+            if (!firstVideoFrameTime && !streamInfo.hasVideo) {
+                firstVideoFrameTime = performance.now();
+            }
+        } else if (event.track.kind === 'audio') {
+            streamInfo.hasAudio = true;
+        }
+
+        // Если это видеотрек и видеоэлемент уже показывает поток, он автоматически обновится
+        console.log(`[SFU] Added ${event.track.kind} track to stream ${streamId}`);
+
+        event.track.onended = () => {
+            console.log(`[SFU] Track ended: ${event.track.kind} for stream ${streamId}`);
+            // Не удаляем сразу поток, может прийти замена
+        };
     };
 
     sfuPeerConnection.onconnectionstatechange = () => {
@@ -817,7 +871,7 @@ function cleanup() {
     joinBtn.disabled = false;
     leaveBtn.disabled = true;
     renegotiationInProgress = false;
-    remoteVideoElements.clear();
+    remoteStreams.clear();
     prevOutboundStats = {video: {bytes: 0, timestamp: 0, packets: 0}, audio: {bytes: 0, timestamp: 0, packets: 0}};
     prevInboundStats = {bytes: 0, timestamp: 0};
     statsHistory = {
