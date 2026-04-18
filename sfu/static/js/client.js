@@ -736,7 +736,6 @@ async function setupSFUPeerConnection() {
 
     sfuPeerConnection.ontrack = (event) => {
         console.log('Remote track:', event.track.kind);
-        // Создаём отдельный поток для каждого трека
         const stream = new MediaStream([event.track]);
         const video = document.createElement('video');
         video.srcObject = stream;

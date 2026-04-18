@@ -138,6 +138,8 @@ class Participant:
                 self.pending_tracks.clear()
                 for sender_id, track, replace_existing in pending:
                     await self.add_or_replace_track(sender_id, track, replace_existing)
+                # После добавления треков инициируем renegotiation
+                await self.notify_renegotiation_needed()
 
         @self.peer_connection.on("icecandidate")
         async def on_icecandidate(candidate):
@@ -158,7 +160,7 @@ class Participant:
             else:
                 logger.info(f"ICE candidate gathering complete for {self.id}")
 
-    async def add_or_replace_track(self, sender_id: str, track,
+    async def _add_or_replace_track(self, sender_id: str, track,
                                    replace_existing: bool = True) -> None:
         logger.info(
             f"add_or_replace_track({self.id}, sender={sender_id}, kind={track.kind}, replace={replace_existing})")
@@ -209,6 +211,74 @@ class Participant:
             return
         senders[track.kind] = sender
         logger.info(f"remote_senders[{sender_id}] now: {list(senders.keys())}")
+        await self.notify_renegotiation_needed()
+
+    async def add_or_replace_track(self, sender_id: str, track,
+                                   replace_existing: bool = True) -> None:
+        logger.info(
+            f"add_or_replace_track({self.id}, sender={sender_id}, kind={track.kind}, replace={replace_existing})")
+        logger.info(f"  current signalingState={self.peer_connection.signalingState}")
+
+        if self.peer_connection.signalingState != "stable":
+            logger.info(
+                f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
+            self.pending_tracks.append((sender_id, track, replace_existing))
+            return
+
+        if sender_id not in self.remote_senders:
+            self.remote_senders[sender_id] = {}
+            logger.info(f"Created remote_senders entry for {sender_id}")
+
+        senders = self.remote_senders[sender_id]
+        existing_sender = senders.get(track.kind)
+
+        # Проверяем, действительно ли sender активен и трек прикреплён
+        sender_valid = False
+        if existing_sender:
+            try:
+                # aiortc RTCRtpSender имеет свойство track
+                if existing_sender.track is not None:
+                    sender_valid = True
+            except Exception:
+                pass
+
+        if replace_existing and existing_sender and sender_valid:
+            logger.info(f"Replacing {track.kind} track from {sender_id} to {self.id}")
+            await existing_sender.replaceTrack(track)
+            return
+
+        if not replace_existing and existing_sender and sender_valid:
+            logger.warning(
+                f"Track {track.kind} from {sender_id} already exists and is active, skipping (replace_existing=False)")
+            return
+
+        # Если sender есть, но невалидный – удаляем его из словаря и пересоздаём
+        if existing_sender and not sender_valid:
+            logger.info(f"Removing invalid sender for {sender_id} ({track.kind})")
+            del senders[track.kind]
+
+        # Создаём новый трансивер с direction='sendonly', если нет свободного
+        transceiver = None
+        for t in self.peer_connection.getTransceivers():
+            logger.info(f"transceiver: {t.kind=} "
+                        f"{t.direction=} "
+                        f"{t.mid=}"
+                        f"{t.sender=}"
+                        f"{t.receiver=}")
+            if t.direction in ('sendonly', 'sendrecv') and t.sender.track is None:
+                transceiver = t
+                break
+        if not transceiver:
+            logger.info(f"Creating new transceiver for {track.kind} (sendonly)")
+            transceiver = self.peer_connection.addTransceiver(track.kind, direction='sendonly')
+        else:
+            logger.info(f"Reusing existing transceiver (mid={transceiver.mid}) for {track.kind}")
+
+        logger.info(f"Adding new {track.kind} track via sender.replaceTrack for {sender_id}")
+        transceiver.sender.replaceTrack(track)
+        senders[track.kind] = transceiver.sender
+        logger.info(f"remote_senders[{sender_id}] now: {list(senders.keys())}")
+
         await self.notify_renegotiation_needed()
 
     async def notify_renegotiation_needed(self) -> None:
