@@ -9,16 +9,23 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 from aiortc.contrib.media import MediaRelay
 
 import aiortc.rtcpeerconnection
+
 original_and_direction = aiortc.rtcpeerconnection.and_direction
+
 
 def patched_and_direction(a, b):
     if a is None or b is None:
         return 'inactive'
     return original_and_direction(a, b)
 
+
 aiortc.rtcpeerconnection.and_direction = patched_and_direction
 
-logging.basicConfig(level=logging.INFO)
+# Настройка логирования с уровнем DEBUG для детализации
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_TIMEOUT: Final[int] = 60
@@ -35,29 +42,39 @@ class Room:
     def add_participant(self, participant: "Participant") -> None:
         self.participants[participant.id] = participant
         logger.info(f"Participant {participant.id} added to room {self.id}")
+        logger.debug(f"Room {self.id} participants: {list(self.participants.keys())}")
 
     def remove_participant(self, participant_id: str) -> None:
         if participant_id in self.participants:
             del self.participants[participant_id]
             logger.info(f"Participant {participant_id} removed from room {self.id}")
+            logger.debug(f"Room {self.id} participants: {list(self.participants.keys())}")
 
     def is_empty(self) -> bool:
         return len(self.participants) == 0
 
     async def broadcast_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
+        logger.debug(
+            f"Broadcasting {track.kind} track from {sender_id} to all except self, replace_existing={replace_existing}")
         for pid, participant in self.participants.items():
             if pid != sender_id:
+                logger.debug(f"  -> sending to {pid}")
                 await participant.add_or_replace_track(sender_id, track, replace_existing)
 
     async def send_existing_tracks_to_newcomer(self, newcomer_id: str) -> None:
         newcomer = self.participants.get(newcomer_id)
         if not newcomer:
+            logger.warning(f"Newcomer {newcomer_id} not found in room")
             return
+        logger.info(f"Sending existing tracks to newcomer {newcomer_id}")
         for pid, participant in self.participants.items():
             if pid == newcomer_id:
                 continue
+            logger.debug(
+                f"  from participant {pid}, local_tracks: {[t.kind for t in participant.local_tracks]}")
             for track in participant.local_tracks:
                 relayed_track = relay.subscribe(track)
+                logger.debug(f"    subscribing to {track.kind} track from {pid}")
                 await newcomer.add_or_replace_track(pid, relayed_track, replace_existing=False)
 
     def __str__(self) -> str:
@@ -82,10 +99,13 @@ class Participant:
         async def on_track(track):
             logger.info(f"Track received from {self.id}: {track.kind}")
             self.local_tracks.add(track)
+            logger.debug(
+                f"Participant {self.id} local_tracks now: {[t.kind for t in self.local_tracks]}")
             await self.room.broadcast_track(self.id, track)
 
             @track.on("ended")
             def on_ended():
+                logger.debug(f"Track {track.kind} ended for {self.id}")
                 self.local_tracks.discard(track)
 
         @self.peer_connection.on("connectionstatechange")
@@ -110,6 +130,7 @@ class Participant:
             state = self.peer_connection.signalingState
             logger.info(f"Signaling state for {self.id}: {state}")
             if state == "stable" and self.pending_tracks:
+                logger.debug(f"Processing {len(self.pending_tracks)} pending tracks for {self.id}")
                 pending = self.pending_tracks.copy()
                 self.pending_tracks.clear()
                 for sender_id, track, replace_existing in pending:
@@ -134,14 +155,21 @@ class Participant:
             else:
                 logger.info(f"ICE candidate gathering complete for {self.id}")
 
-    async def add_or_replace_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
+    async def add_or_replace_track(self, sender_id: str, track,
+                                   replace_existing: bool = True) -> None:
+        logger.debug(
+            f"add_or_replace_track({self.id}, sender={sender_id}, kind={track.kind}, replace={replace_existing})")
+        logger.debug(f"  current signalingState={self.peer_connection.signalingState}")
+
         if self.peer_connection.signalingState != "stable":
-            logger.info(f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
+            logger.info(
+                f"Deferring add track for {sender_id} ({track.kind}) because state is {self.peer_connection.signalingState}")
             self.pending_tracks.append((sender_id, track, replace_existing))
             return
 
         if sender_id not in self.remote_senders:
             self.remote_senders[sender_id] = {}
+            logger.debug(f"Created remote_senders entry for {sender_id}")
 
         senders = self.remote_senders[sender_id]
         existing_sender = senders.get(track.kind)
@@ -152,19 +180,23 @@ class Participant:
             return
 
         if not replace_existing and existing_sender:
-            logger.warning(f"Track {track.kind} already exists, skipping")
+            logger.warning(
+                f"Track {track.kind} from {sender_id} already exists, skipping (replace_existing=False)")
             return
 
+        # Новый трек – используем addTrack
         logger.info(f"Adding new {track.kind} track via addTrack for {sender_id}")
         sender = self.peer_connection.addTrack(track)
         if sender is None:
             logger.error(f"addTrack returned None for {track.kind}")
             return
         senders[track.kind] = sender
+        logger.debug(f"remote_senders[{sender_id}] now: {list(senders.keys())}")
         await self.notify_renegotiation_needed()
 
     async def notify_renegotiation_needed(self) -> None:
         if self._renegotiation_pending:
+            logger.debug(f"Renegotiation already pending for {self.id}, skipping")
             return
         self._renegotiation_pending = True
         try:
@@ -251,18 +283,21 @@ async def handle_client(websocket) -> None:
                 continue
 
             msg_type = data.get("type")
+            logger.debug(f"Received message from {participant_id or '?'}: type={msg_type}")
 
             if msg_type == "join":
                 room_id = data.get("room")
                 participant_id = data.get("participant_id")
                 if not room_id or not participant_id:
-                    await websocket.send(json.dumps({"type": "error", "message": "room and participant_id required"}))
+                    await websocket.send(json.dumps(
+                        {"type": "error", "message": "room and participant_id required"}))
                     continue
 
                 room = room_manager.get_or_create(room_id)
                 participant = Participant(participant_id, room, websocket)
                 room.add_participant(participant)
                 await websocket.send(json.dumps({"type": "joined", "room": room_id}))
+                logger.info(f"Joined: {participant_id} in room {room_id}")
 
             elif msg_type == "offer":
                 if not participant:
@@ -272,8 +307,11 @@ async def handle_client(websocket) -> None:
                 logger.info(f"Received offer from {participant.id}")
                 offer = RTCSessionDescription(sdp=data["sdp"], type=data["type"])
                 await participant.peer_connection.setRemoteDescription(offer)
+                logger.debug(
+                    f"After setRemoteDescription, signalingState={participant.peer_connection.signalingState}")
 
                 if not participant._tracks_initialized:
+                    logger.info(f"Initializing tracks for newcomer {participant.id}")
                     await room.send_existing_tracks_to_newcomer(participant.id)
                     participant._tracks_initialized = True
 
@@ -293,7 +331,8 @@ async def handle_client(websocket) -> None:
                     finally:
                         participant._renegotiation_pending = False
                 else:
-                    logger.warning(f"Unexpected signaling state after setRemoteDescription: {participant.peer_connection.signalingState}")
+                    logger.warning(
+                        f"Unexpected signaling state after setRemoteDescription: {participant.peer_connection.signalingState}")
 
             elif msg_type == "answer":
                 if not participant:
@@ -303,6 +342,7 @@ async def handle_client(websocket) -> None:
                 answer = RTCSessionDescription(sdp=data["sdp"], type="answer")
                 await participant.peer_connection.setRemoteDescription(answer)
                 participant._renegotiation_pending = False
+                logger.info(f"Received answer for {participant.id}")
 
             elif msg_type == "ice-candidate":
                 if not participant:
@@ -319,6 +359,7 @@ async def handle_client(websocket) -> None:
                 try:
                     candidate = create_ice_candidate_from_js(candidate_data)
                     await participant.peer_connection.addIceCandidate(candidate)
+                    logger.debug(f"Added ICE candidate for {participant.id}: {candidate_str[:50]}")
                 except Exception as e:
                     logger.warning(f"Failed to add ICE candidate: {e}")
 
@@ -326,7 +367,8 @@ async def handle_client(websocket) -> None:
                 break
 
             else:
-                await websocket.send(json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
+                await websocket.send(
+                    json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
 
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"WebSocket closed for {participant_id}")
@@ -350,7 +392,7 @@ async def main() -> None:
         ssl_context = None
         proto = "ws"
 
-    async with websockets.serve(handle_client, "0.0.0.0", 8001, ssl=ssl_context, max_size=10**7):
+    async with websockets.serve(handle_client, "0.0.0.0", 8001, ssl=ssl_context, max_size=10 ** 7):
         logger.info(f"SFU server started on {proto}://0.0.0.0:8001")
         await asyncio.Future()
 
