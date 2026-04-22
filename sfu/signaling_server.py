@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-SFU_WS_URL = "wss://81.26.180.66:8001/ws"
+SFU_WS_URL = "wss://81.26.178.64:8001/ws"
 HEARTBEAT_TIMER: Final[int] = 30
 HEARTBEAT_TIMEOUT: Final[int] = 60
 
