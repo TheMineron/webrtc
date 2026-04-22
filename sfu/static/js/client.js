@@ -27,7 +27,6 @@ const remoteStreams = new Map();
 let renegotiateNeeded = false;
 let renegotiateRunning = false;
 
-// --- E2E тест переменные ---
 let e2eTestInProgress = false;
 let e2eStartTime = null;
 let e2eRemoteMonitor = false;
@@ -36,7 +35,6 @@ let originalVideoTrack = null;
 let canvasStream = null;
 let lastE2eResult = null;
 
-// --- Метрики и статистика ---
 let conferenceStartTime = null;
 let callStartTime = null;
 let firstVideoFrameTime = null;
@@ -61,7 +59,6 @@ let websocketPingInterval = null;
 let e2eTestInterval = null;
 let lastWebsocketRtt = null;
 
-// --- Элементы DOM ---
 const videosContainer = document.getElementById('videos');
 const statusDiv = document.getElementById('status');
 const joinBtn = document.getElementById('joinBtn');
@@ -96,7 +93,7 @@ function addVideoElement(stream, label, isLocal = false) {
     return video;
 }
 
-// --- E2E тест: вспышка цветом ---
+
 async function flashColorOnStream(color, duration = 300) {
     if (!localStream) return;
     const videoTrack = localStream.getVideoTracks()[0];
@@ -185,7 +182,6 @@ function startE2eVideoLatencyTest() {
     }, 500);
 }
 
-// --- ИСПРАВЛЕНА функция processRenegotiation ---
 async function processRenegotiation() {
     if (renegotiateRunning) {
         console.log('[SFU] Renegotiation already running, marking needed');
@@ -704,11 +700,9 @@ async function connectToSFU(sfuUrl) {
     }
 }
 
-// --- ИСПРАВЛЕНА функция setupSFUPeerConnection ---
 async function setupSFUPeerConnection() {
     sfuPeerConnection = new RTCPeerConnection(pcConfig);
 
-    // FIXED: Явно создаём трансиверы для аудио и видео, чтобы они были готовы принимать входящие треки
     sfuPeerConnection.addTransceiver('audio', {direction: 'sendrecv'});
     sfuPeerConnection.addTransceiver('video', {direction: 'sendrecv'});
 
