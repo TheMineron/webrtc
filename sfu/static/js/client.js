@@ -23,7 +23,7 @@ let roomId = '';
 let participantId = '';
 let nickname = '';
 let renegotiationInProgress = false;
-const remoteStreams = new Map(); // key = streamId (например, participantId), value = { videoElement, stream }
+const remoteStreams = new Map();
 let renegotiateNeeded = false;
 let renegotiateRunning = false;
 

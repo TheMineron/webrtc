@@ -96,6 +96,7 @@ class Participant:
         self.local_tracks: Set = set()
         self.remote_senders: Dict[str, Dict[str, object]] = {}
         self._renegotiation_pending = False
+        self._pending_renegotiation = False
         self._tracks_initialized = False
         self.pending_tracks = []  # (sender_id, track, replace_existing)
         self._setup_peer_connection_handlers()
@@ -214,9 +215,11 @@ class Participant:
 
     async def notify_renegotiation_needed(self) -> None:
         if self._renegotiation_pending:
-            logger.info(f"Renegotiation already pending for {self.id}, skipping")
+            logger.info(f"Renegotiation already pending for {self.id}, marking for later")
+            self._pending_renegotiation = True
             return
         self._renegotiation_pending = True
+        self._pending_renegotiation = False
         try:
             logger.info(f"Sending renegotiate to {self.id}")
             await self.websocket.send(json.dumps({"type": "renegotiate"}))
@@ -342,24 +345,31 @@ async def handle_client(websocket) -> None:
                             "sdp": participant.peer_connection.localDescription.sdp,
                         }))
                         logger.info(f"Sent answer to {participant.id}")
+                        participant._renegotiation_pending = False
+                        if participant._pending_renegotiation:
+                            logger.info(f"Triggering pending renegotiation for {participant.id}")
+                            participant._pending_renegotiation = False
+                            await participant.notify_renegotiation_needed()
                     except Exception as e:
                         logger.error(f"Failed to create/send answer: {e}", exc_info=True)
-                        await participant.notify_renegotiation_needed()
-                    finally:
                         participant._renegotiation_pending = False
                 else:
                     logger.warning(f"Unexpected signaling state after setRemoteDescription: {participant.peer_connection.signalingState}")
+
 
             elif msg_type == "answer":
                 if not participant:
                     await websocket.send(json.dumps({"type": "error", "message": "Not joined"}))
                     continue
-
                 answer = RTCSessionDescription(sdp=data["sdp"], type="answer")
-                logger.info(f"SDP answer for {participant.id}:\n{answer.sdp}")
                 await participant.peer_connection.setRemoteDescription(answer)
                 participant._renegotiation_pending = False
                 logger.info(f"Received answer for {participant.id}")
+                if participant._pending_renegotiation:
+                    logger.info(
+                        f"Triggering pending renegotiation for {participant.id} after answer")
+                    participant._pending_renegotiation = False
+                    await participant.notify_renegotiation_needed()
 
             elif msg_type == "ice-candidate":
                 if not participant:
