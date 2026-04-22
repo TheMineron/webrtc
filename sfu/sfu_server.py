@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import ssl
-from typing import Dict, Set, Final, Optional
+from typing import Dict, Set, Final
 
 import websockets
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
