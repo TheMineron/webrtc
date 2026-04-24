@@ -2,24 +2,25 @@ import asyncio
 import json
 import logging
 import ssl
-from typing import Dict, Set, Final
+from abc import ABCMeta, abstractmethod
+from typing import Dict, Set, Final, TypeAlias
 
 import websockets
+import aiortc.rtcpeerconnection as rtc_peer_connection
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 from aiortc.contrib.media import MediaRelay
+from websockets import ServerConnection
 
-import aiortc.rtcpeerconnection
-
-original_and_direction = aiortc.rtcpeerconnection.and_direction
+original_and_direction = rtc_peer_connection.and_direction
 
 
-def patched_and_direction(a, b):
+def patched_and_direction(a: str, b: str) -> str:
     if a is None or b is None:
         return 'inactive'
     return original_and_direction(a, b)
 
 
-aiortc.rtcpeerconnection.and_direction = patched_and_direction
+rtc_peer_connection.and_direction = patched_and_direction
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,9 +53,17 @@ class Room:
     def is_empty(self) -> bool:
         return len(self.participants) == 0
 
-    async def broadcast_track(self, sender_id: str, track, replace_existing: bool = True) -> None:
+    async def broadcast_track(
+            self,
+            sender_id: str,
+            track,
+            replace_existing: bool = True
+    ) -> None:
         logger.info(
-            f"Broadcasting {track.kind} track from {sender_id} to all except self, replace_existing={replace_existing}")
+            f"Broadcasting {track.kind} track from "
+            f"{sender_id} to all except self, "
+            f"replace_existing={replace_existing}"
+        )
         for pid, participant in self.participants.items():
             if pid != sender_id:
                 logger.info(f"  -> sending to {pid}")
@@ -70,7 +79,9 @@ class Room:
             if pid == newcomer_id:
                 continue
             logger.info(
-                f"  from participant {pid}, local_tracks: {[t.kind for t in participant.local_tracks]}")
+                f"  from participant {pid}, local_tracks: "
+                f"{[t.kind for t in participant.local_tracks]}"
+            )
             for track in participant.local_tracks:
                 relayed_track = relay.subscribe(track)
                 if relayed_track is None:
@@ -174,8 +185,12 @@ class Participant:
             else:
                 logger.info(f"ICE candidate gathering complete for {self.id}")
 
-    async def add_or_replace_track(self, sender_id: str, track,
-                                   replace_existing: bool = True) -> None:
+    async def add_or_replace_track(
+            self,
+            sender_id: str,
+            track,
+            replace_existing: bool = True
+    ) -> None:
         logger.info(
             f"add_or_replace_track({self.id}, "
             f"sender={sender_id}, "
@@ -277,6 +292,9 @@ class Participant:
         return f"{self.id}"
 
 
+RoomParticipantPair: TypeAlias = tuple[Room | None, Participant | None]
+
+
 class RoomManager:
     def __init__(self) -> None:
         self.rooms: Dict[str, Room] = {}
@@ -333,9 +351,22 @@ class CommandContext:
         self.current_participant = current_participant
 
 
-class JoinCommand:
-    @staticmethod
-    async def handle(ctx: CommandContext, data: dict):
+class Command(metaclass=ABCMeta):
+    @abstractmethod
+    async def handle(
+            self,
+            ctx: CommandContext,
+            data: dict
+    ) -> RoomParticipantPair:
+        pass
+
+
+class JoinCommand(Command):
+    async def handle(
+            self,
+            ctx: CommandContext,
+            data: dict
+    ) -> RoomParticipantPair:
         room_id = data.get("room")
         participant_id = data.get("participant_id")
         if not room_id or not participant_id:
@@ -357,9 +388,12 @@ class JoinCommand:
         return room, participant
 
 
-class OfferCommand:
-    @staticmethod
-    async def handle(ctx: CommandContext, data: dict):
+class OfferCommand(Command):
+    async def handle(
+            self,
+            ctx: CommandContext,
+            data: dict
+    ) -> RoomParticipantPair:
         if not ctx.current_participant:
             await safe_send_json(
                 ctx.websocket,
@@ -401,9 +435,12 @@ class OfferCommand:
         return ctx.current_room, ctx.current_participant
 
 
-class AnswerCommand:
-    @staticmethod
-    async def handle(ctx: CommandContext, data: dict):
+class AnswerCommand(Command):
+    async def handle(
+            self,
+            ctx: CommandContext,
+            data: dict
+    ) -> RoomParticipantPair:
         if not ctx.current_participant:
             return ctx.current_room, ctx.current_participant
 
@@ -419,9 +456,12 @@ class AnswerCommand:
         return ctx.current_room, ctx.current_participant
 
 
-class IceCandidateCommand:
-    @staticmethod
-    async def handle(ctx: CommandContext, data: dict):
+class IceCandidateCommand(Command):
+    async def handle(
+            self,
+            ctx: CommandContext,
+            data: dict
+    ) -> RoomParticipantPair:
         if not ctx.current_participant:
             return ctx.current_room, ctx.current_participant
 
@@ -447,9 +487,12 @@ class IceCandidateCommand:
         return ctx.current_room, ctx.current_participant
 
 
-class LeaveCommand:
-    @staticmethod
-    async def handle(ctx: CommandContext, data: dict):
+class LeaveCommand(Command):
+    async def handle(
+            self,
+            ctx: CommandContext,
+            data: dict
+    ) -> RoomParticipantPair:
         return ctx.current_room, ctx.current_participant
 
 
@@ -462,14 +505,14 @@ COMMAND_HANDLERS = {
 }
 
 
-async def safe_send_json(websocket, data: dict):
+async def safe_send_json(websocket: ServerConnection, data: dict) -> None:
     try:
         await websocket.send(json.dumps(data))
     except Exception as e:
         logger.error(f"Failed to send message: {e}")
 
 
-async def handle_client(websocket):
+async def handle_client(websocket: ServerConnection) -> None:
     participant_id = None
     current_room = None
     current_participant = None
