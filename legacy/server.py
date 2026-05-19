@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="p2p/static"), name="static")
+app.mount("../p2p/static", StaticFiles(directory="p2p/static"), name="static")
 
 
 class Participant:
